@@ -156,21 +156,32 @@ function updateAccountSelects() {
         `<option value="${acc.id}">${escapeHtml(acc.name)}</option>`
     ).join('');
 
-    const selects = ['check-account', 'file-account', 'violation-account-filter', 'dupe-account'];
-    selects.forEach(id => {
+    // 操作类下拉：无有效选择时默认选中第一个账号，避免每次切页重选
+    const autoSelects = ['check-account', 'file-account', 'dupe-account'];
+    autoSelects.forEach(id => {
         const select = document.getElementById(id);
-        if (select) {
-            const current = select.value;
-            const firstOption = select.querySelector('option');
-            select.innerHTML = firstOption.outerHTML + options;
+        if (!select) return;
+        const current = select.value;
+        const firstOption = select.querySelector('option');
+        select.innerHTML = firstOption.outerHTML + options;
+        if (current && accounts.some(a => a.id == current)) {
+            select.value = current;
+        } else if (accounts.length > 0) {
+            select.value = accounts[0].id;
+            select.dispatchEvent(new Event('change'));
+        }
+    });
 
-            // 保留原选择；没有则默认选中第一个账号，避免每次切页重选
-            if (current && accounts.some(a => a.id == current)) {
-                select.value = current;
-            } else if (accounts.length > 0) {
-                select.value = accounts[0].id;
-                select.dispatchEvent(new Event('change'));
-            }
+    // 筛选类下拉：保留「全部账号」等占位选择，仅刷新选项
+    const filterSelects = ['violation-account-filter'];
+    filterSelects.forEach(id => {
+        const select = document.getElementById(id);
+        if (!select) return;
+        const current = select.value;
+        const firstOption = select.querySelector('option');
+        select.innerHTML = firstOption.outerHTML + options;
+        if (current && accounts.some(a => a.id == current)) {
+            select.value = current;
         }
     });
 }

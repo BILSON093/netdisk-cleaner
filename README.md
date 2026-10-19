@@ -54,7 +54,7 @@ npm run build
 
 - 后端：Node.js + Express，百度网盘 Web API（与网页版同接口）
 - 前端：原生 HTML/CSS/JS，无构建步骤
-- 存储：JSON 文件（`data/data.json`，运行时自动生成，**含账号 Cookie，已在 .gitignore 排除**）
+- 存储：JSON 文件（`data/data.json`，运行时自动生成）
 - 登录：puppeteer-core 调起本机 Chrome/Edge 完成扫码/账号登录
 
 ## 检测原理速览

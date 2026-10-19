@@ -112,7 +112,7 @@ class ViolationChecker {
         try {
             const r = await this.api.downloadDlink([f.fs_id]);
             if (r.errno === 113) { await this.api.refreshSign().catch(() => {}); return false; }
-            // 健康 = errno 0 且确实返回了 dlink（errno 0 但 dlink 为空是和谐文件的特征）
+            // 健康 = errno 0 且确实返回了 dlink
             return r.errno === 0 && r.hasDlink;
         } catch (e) {
             return false;
@@ -196,12 +196,12 @@ class ViolationChecker {
             if (r.errno === 0 && r.hasDlink) return false;          // 实为正常
             if (r.errno === 113) { i--; await this.api.refreshSign().catch(() => {}); consistentNeg = 0; continue; }
             if (this.isRateLimitErrno(r.errno)) { i--; consistentNeg = 0; await this.rateLimitBackoff(); continue; }
-            if (r.errno === 0 && !r.hasDlink) {                     // errno 0 但 dlink 空 → 硬和谐 和谐
+            if (r.errno === 0 && !r.hasDlink) {                     // errno 0 但 dlink 空 → 不可下载
                 consistentNeg++;
                 if (consistentNeg >= 2) return true;
                 continue;
             }
-            if (r.errno === -1) {                                   // 账号健康下的 -1 → 软和谐 和谐
+            if (r.errno === -1) {                                   // 账号健康下的 -1 → 不可下载
                 consistentNeg++;
                 if (consistentNeg >= 2) return true;
                 continue;
@@ -245,14 +245,14 @@ class ViolationChecker {
         if (r.errno === 'stopped') return;
 
         if (r.errno === 0) {
-            // errno 0 时 dlink 数组可能不全：缺席的 fid 即 硬和谐 和谐文件（dlink 条目带 fs_id 可直接定位）
+            // errno 0 时 dlink 数组可能不全：缺席的 fid 即不可下载文件（dlink 条目带 fs_id 可直接定位）
             const dlinks = (r.raw && Array.isArray(r.raw.dlink)) ? r.raw.dlink : [];
             const okIds = new Set(dlinks.map(x => String(x.fs_id)));
             for (const f of files) {
                 if (okIds.has(String(f.fs_id))) {
                     await this.recordNormal(f);
                 } else {
-                    // 缺席 → 疑似 硬和谐 和谐，单文件复核确认
+                    // 缺席 → 疑似不可下载，单文件复核确认
                     const isHarm = await this.confirmHarmonized(f);
                     if (isHarm === true) await this.recordViolation(f);
                     else if (isHarm === false) await this.recordNormal(f);

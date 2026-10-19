@@ -4,9 +4,9 @@
 
 ## 检测原理
 
-基于百度网盘网页版的下载直链探测流程：
+基于百度网盘 Web API 的下载直链探测流程：
 
-1. 调用 `/api/gettemplatevariable` 获取 `sign1/sign3/timestamp`，用 RC4 算法计算签名（与官方客户端一致）
+1. 调用 `/api/gettemplatevariable` 获取签名素材（`sign1/sign3/timestamp`），计算请求签名
 2. 调用 `GET /api/download?type=dlink&fidlist=[...]` 批量请求下载直链（每批最多 10 个 fid）
 3. 根据响应判定：
    - `errno=0` 且全部返回直链 → 整批正常

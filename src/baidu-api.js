@@ -36,7 +36,7 @@ class BaiduPanAPI {
         this.client = axios.create(axiosConfig);
     }
 
-    // 生成logid（与官方客户端一致：base64(BAIDUID + ":FG=1")）
+    // 生成 logid：base64(BAIDUID + ":FG=1")
     generateLogid() {
         const match = this.cookies.match(/BAIDUID=([^;:]+)/i);
         if (!match) return '';
@@ -302,16 +302,15 @@ class BaiduPanAPI {
         }
     }
 
-    // ============ 和谐文件检测：download 直链法（与主流实现一致）============
+    // ============ 和谐文件检测：直链可达性判定 ============
     // GET /api/download?type=dlink 提交一组 fid：
     //   errno 0            → 全部正常（返回 dlink）
-    //   errno -1           → 组内含和谐文件（无法获取直链）；也可能是限流，需结合参照文件判断
-    //   errno 113          → sign 失效，需刷新
+    //   errno -1           → 组内含不可下载文件；也可能是限流，需结合参照文件判断
+    //   errno 113          → sign 过期，需刷新
     //   errno -7/112/429/414 → 频率限制
     //   errno 2            → 瞬时错误，重试
-    // sign = base64(RC4(key=sign3, data=sign1))
-    // 已验证：和谐文件（含"软和谐"——元数据正常、有dlink字段、本体可下载，
-    // 但缩略图被替换为占位图、分享返回109）在本接口稳定返回 -1
+    // sign 计算：base64(RC4(key=sign3, data=sign1))
+    // 注：errno 0 时个别 fid 可能缺席于返回的 dlink 数组，缺席即视为不可下载
     rc4(key, data) {
         const a = [], p = [], v = key.length;
         for (let q = 0; q < 256; q++) { a[q] = key.substr(q % v, 1).charCodeAt(0); p[q] = q; }
@@ -325,7 +324,7 @@ class BaiduPanAPI {
         return out;
     }
 
-    // 刷新下载签名（sign1/sign3/timestamp 由 gettemplatevariable 提供）
+    // 刷新下载签名（签名素材由服务端下发）
     async refreshSign() {
         const logid = this.generateLogid();
         const url = `https://pan.baidu.com/api/gettemplatevariable?fields=[%22sign1%22,%22sign2%22,%22sign3%22,%22timestamp%22]&channel=chunlei&web=1&app_id=250528&bdstoken=${this.bdstoken}${logid ? '&logid=' + encodeURIComponent(logid) : ''}&clienttype=0`;

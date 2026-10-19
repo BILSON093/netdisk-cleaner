@@ -1,6 +1,6 @@
-# Baidu Pan Cleaner
+# Netdisk Cleaner
 
-免费开源的百度网盘清理工具：检测被和谐的违规文件、扫描重复文件、批量清理。本地运行，数据不出机。
+免费开源的网盘清理工具：检测被和谐的违规文件、扫描重复文件、批量清理。本地运行，数据不出机。
 
 Free & open-source Baidu Netdisk cleaner: detect harmonized (blocked) files, find duplicates, and batch-clean them. Runs locally — your cookies and data never leave your machine.
 

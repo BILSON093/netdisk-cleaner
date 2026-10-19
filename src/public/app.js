@@ -714,9 +714,9 @@ function renderViolations(records) {
 function renderPagination(total, page, pageSize) {
     const totalPages = Math.ceil(total / pageSize);
     const container = document.getElementById('violations-pagination');
-    
+
     if (totalPages <= 1) {
-        container.innerHTML = '';
+        container.innerHTML = total > 0 ? `<span style="color: var(--text-tertiary);">共 ${total} 条</span>` : '';
         return;
     }
     
@@ -822,6 +822,8 @@ async function deleteViolation(id) {
 
 let currentFilePath = '/';
 let currentFileAccount = null;
+let fileListPage = 1;         // 文件浏览当前页
+const FILE_LIST_SIZE = 100;   // 文件浏览每页条数
 
 function loadFileAccounts() {
     const select = document.getElementById('file-account');
@@ -839,26 +841,22 @@ document.getElementById('file-account').addEventListener('change', (e) => {
     }
 });
 
-async function loadFileList() {
+async function loadFileList(page = 1) {
     if (!currentFileAccount) return;
-    
+    fileListPage = page;
+
     updateFilePathNav();
-    
+
     const tbody = document.getElementById('files-body');
     tbody.innerHTML = '<tr><td colspan="4" class="text-center text-muted">加载中...</td></tr>';
-    
+
     try {
-        const res = await API.get(`/api/files?accountId=${currentFileAccount}&dir=${encodeURIComponent(currentFilePath)}&num=200`);
+        const res = await API.get(`/api/files?accountId=${currentFileAccount}&dir=${encodeURIComponent(currentFilePath)}&num=${FILE_LIST_SIZE}&page=${page}`);
         if (res.success) {
             const files = res.data.list || [];
-            
-            if (files.length === 0 && currentFilePath === '/') {
-                tbody.innerHTML = '<tr><td colspan="4" class="text-center text-muted">网盘为空</td></tr>';
-                return;
-            }
-            
+
             let html = '';
-            if (currentFilePath !== '/') {
+            if (page === 1 && currentFilePath !== '/') {
                 html += `
                     <tr>
                         <td colspan="4">
@@ -868,14 +866,14 @@ async function loadFileList() {
                     </tr>
                 `;
             }
-            
-            if (files.length === 0) {
-                html += '<tr><td colspan="4" class="text-center text-muted">此目录为空</td></tr>';
+
+            if (files.length === 0 && page === 1) {
+                html += `<tr><td colspan="4" class="text-center text-muted">${currentFilePath === '/' ? '网盘为空' : '此目录为空'}</td></tr>`;
             } else {
-                // 文件夹在前
+                // 文件夹在前（单页内排序）
                 const dirs = files.filter(f => f.isdir === 1);
                 const fileList = files.filter(f => f.isdir === 0);
-                
+
                 html += dirs.map(f => `
                     <tr>
                         <td>
@@ -892,7 +890,7 @@ async function loadFileList() {
                         </td>
                     </tr>
                 `).join('');
-                
+
                 html += fileList.map(f => `
                     <tr>
                         <td>${getFileIcon(f.server_filename, 0)}${escapeHtml(f.server_filename)}</td>
@@ -902,14 +900,32 @@ async function loadFileList() {
                     </tr>
                 `).join('');
             }
-            
+
             tbody.innerHTML = html;
+
+            // 网盘接口无总数，用 has_more 判断是否还有下一页
+            const hasMore = res.data.has_more === 1 || files.length >= FILE_LIST_SIZE;
+            renderFilesPagination(page, hasMore);
         } else {
             tbody.innerHTML = `<tr><td colspan="4" class="text-center text-danger">${escapeHtml(res.message)}</td></tr>`;
+            document.getElementById('files-pagination').innerHTML = '';
         }
     } catch (e) {
         tbody.innerHTML = `<tr><td colspan="4" class="text-center text-danger">加载失败: ${escapeHtml(e.message)}</td></tr>`;
+        document.getElementById('files-pagination').innerHTML = '';
     }
+}
+
+function renderFilesPagination(page, hasMore) {
+    const container = document.getElementById('files-pagination');
+    if (page <= 1 && !hasMore) {
+        container.innerHTML = '';
+        return;
+    }
+    container.innerHTML =
+        `<button ${page <= 1 ? 'disabled' : ''} onclick="loadFileList(${page - 1})">上一页</button>` +
+        `<button class="active">${page}</button>` +
+        `<button ${!hasMore ? 'disabled' : ''} onclick="loadFileList(${page + 1})">下一页</button>`;
 }
 
 function updateFilePathNav() {
@@ -962,6 +978,9 @@ let dupeGroupsPage = 1;       // 结果分组当前页
 const DUPE_PAGE_SIZE = 50;    // 每页渲染的分组数
 let dupeKeyword = '';         // 结果分组搜索词
 let dupeCheckedPaths = new Set(); // 勾选待删的文件路径（跨页/搜索保持）
+let dupeHistoryList = [];     // 历史扫描列表缓存
+let dupeHistoryPage = 1;      // 历史扫描当前页
+const DUPE_HISTORY_SIZE = 10; // 历史扫描每页条数
 
 document.getElementById('btn-start-dupes').addEventListener('click', async () => {
     const accountId = document.getElementById('dupe-account').value;
@@ -1024,19 +1043,37 @@ function stopDupePolling() {
     document.getElementById('btn-stop-dupes').style.display = 'none';
 }
 
-// 历史扫描列表
+// 历史扫描列表（前端分页）
 async function loadDupeScans() {
     const accountId = document.getElementById('dupe-account').value;
     const url = accountId ? `/api/dupes/scans?accountId=${accountId}` : '/api/dupes/scans';
     const res = await API.get(url);
-    const body = document.getElementById('dupe-history-body');
 
-    if (!res.success || res.data.length === 0) {
+    if (!res.success) {
+        document.getElementById('dupe-history-body').innerHTML = '<tr><td colspan="6" class="text-center text-muted">暂无扫描记录</td></tr>';
+        document.getElementById('dupe-history-pagination').innerHTML = '';
+        return;
+    }
+    dupeHistoryList = res.data;
+    renderDupeHistory();
+}
+
+function renderDupeHistory() {
+    const body = document.getElementById('dupe-history-body');
+    const pagination = document.getElementById('dupe-history-pagination');
+
+    if (dupeHistoryList.length === 0) {
         body.innerHTML = '<tr><td colspan="6" class="text-center text-muted">暂无扫描记录</td></tr>';
+        pagination.innerHTML = '';
         return;
     }
 
-    body.innerHTML = res.data.map(s => `
+    const totalPages = Math.ceil(dupeHistoryList.length / DUPE_HISTORY_SIZE);
+    if (dupeHistoryPage > totalPages) dupeHistoryPage = totalPages;
+    const offset = (dupeHistoryPage - 1) * DUPE_HISTORY_SIZE;
+    const pageItems = dupeHistoryList.slice(offset, offset + DUPE_HISTORY_SIZE);
+
+    body.innerHTML = pageItems.map(s => `
         <tr>
             <td>${formatDate(s.created_at)}</td>
             <td class="filename-cell" title="${escapeHtml(s.dir)}">${escapeHtml(s.dir)}</td>
@@ -1049,9 +1086,32 @@ async function loadDupeScans() {
             </td>
         </tr>
     `).join('');
+
+    if (totalPages <= 1) {
+        pagination.innerHTML = `<span style="color: var(--text-tertiary);">共 ${dupeHistoryList.length} 条</span>`;
+        return;
+    }
+    const p = dupeHistoryPage;
+    let html = `<button ${p <= 1 ? 'disabled' : ''} onclick="goToDupeHistoryPage(${p - 1})">上一页</button>`;
+    const start = Math.max(1, p - 2);
+    const end = Math.min(totalPages, p + 2);
+    for (let i = start; i <= end; i++) {
+        html += `<button class="${i === p ? 'active' : ''}" onclick="goToDupeHistoryPage(${i})">${i}</button>`;
+    }
+    html += `<button ${p >= totalPages ? 'disabled' : ''} onclick="goToDupeHistoryPage(${p + 1})">下一页</button>`;
+    html += `<span style="margin-left: 10px; color: var(--text-tertiary);">共 ${dupeHistoryList.length} 条</span>`;
+    pagination.innerHTML = html;
 }
 
-document.getElementById('dupe-account').addEventListener('change', loadDupeScans);
+function goToDupeHistoryPage(page) {
+    dupeHistoryPage = page;
+    renderDupeHistory();
+}
+
+document.getElementById('dupe-account').addEventListener('change', () => {
+    dupeHistoryPage = 1;
+    loadDupeScans();
+});
 
 async function removeDupeScan(id) {
     if (!confirm('删除这条扫描记录？（不会删除网盘文件）')) return;

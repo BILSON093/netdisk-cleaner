@@ -2,10 +2,12 @@
   "name": "baidu-pan-cleaner",
   "version": "1.0.0",
   "description": "Free & open-source Baidu Netdisk cleaner: detect harmonized (blocked) files, find duplicates, batch cleanup",
-  "main": "src/main.js",
+  "main": "electron/main.js",
   "scripts": {
     "start": "node src/main.js",
     "dev": "node src/main.js",
+    "desktop": "electron .",
+    "dist": "electron-builder --win portable",
     "build": "pkg . --targets node18-win-x64 --output dist/baidu-pan-cleaner.exe --no-bytecode"
   },
   "keywords": [
@@ -33,5 +35,27 @@
       "node18-win-x64"
     ],
     "outputPath": "dist"
+  },
+  "build": {
+    "appId": "com.bilson093.netdisk-cleaner",
+    "productName": "NetdiskCleaner",
+    "files": [
+      "src/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": "portable"
+    },
+    "portable": {
+      "artifactName": "NetdiskCleaner-portable.exe"
+    },
+    "directories": {
+      "output": "dist"
+    }
+  },
+  "devDependencies": {
+    "electron": "^44.9.0",
+    "electron-builder": "^26.15.3"
   }
 }

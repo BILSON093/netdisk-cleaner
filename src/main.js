@@ -12,6 +12,10 @@ const PORT = process.env.PORT || 37471;
 
 // 获取应用程序基础目录（打包后为exe所在目录）
 function getAppDir() {
+    // 显式指定数据目录（如 Electron 便携模式）
+    if (process.env.CLEANER_DATA_DIR) {
+        return process.env.CLEANER_DATA_DIR;
+    }
     // pkg 环境下使用 exe 所在目录
     if (process.pkg) {
         return path.dirname(process.execPath);
@@ -734,17 +738,30 @@ app.post('/api/settings', (req, res) => {
     }
 });
 
-// 启动服务器
-app.listen(PORT, () => {
-    console.log(`========================================`);
-    console.log(`  百度网盘和谐文件清理工具 - 免费开源版`);
-    console.log(`  服务器已启动: http://localhost:${PORT}`);
-    console.log(`  数据目录: ${dataDir}`);
-    console.log(`========================================`);
-    
-    // 自动打开浏览器
-    const { exec } = require('child_process');
-    exec(`start http://localhost:${PORT}`, (err) => {
-        if (err) console.log('请手动打开浏览器访问: http://localhost:' + PORT);
+// 启动服务器；port 传 0 时由系统分配随机端口（Electron 模式避免端口冲突）
+function startServer(port = PORT) {
+    return new Promise((resolve) => {
+        const server = app.listen(port, () => {
+            const actualPort = server.address().port;
+            console.log(`========================================`);
+            console.log(`  Netdisk Cleaner - 免费开源版`);
+            console.log(`  服务器已启动: http://localhost:${actualPort}`);
+            console.log(`  数据目录: ${dataDir}`);
+            console.log(`========================================`);
+            resolve({ server, port: actualPort });
+        });
     });
-});
+}
+
+// 直接运行（node src/main.js）时启动并自动打开浏览器；
+// 被 Electron require 时由 electron/main.js 调用 startServer 并加载窗口
+if (require.main === module) {
+    startServer().then(({ port }) => {
+        const { exec } = require('child_process');
+        exec(`start http://localhost:${port}`, (err) => {
+            if (err) console.log('请手动打开浏览器访问: http://localhost:' + port);
+        });
+    });
+}
+
+module.exports = { app, startServer };

@@ -665,7 +665,7 @@ async function runDeleteWithProgress(url, body, btn, onDone) {
 // ========== 违规记录 ==========
 
 let violationsPage = 1;
-const violationsPageSize = 50;
+const violationsPageSize = 25;
 
 async function loadViolations() {
     const accountId = document.getElementById('violation-account-filter').value;
@@ -975,7 +975,7 @@ let dupeTaskId = null;
 let dupePollTimer = null;
 let dupeCurrentScan = null;   // 当前查看的扫描快照 {id, account_id, ...}
 let dupeGroupsPage = 1;       // 结果分组当前页
-const DUPE_PAGE_SIZE = 50;    // 每页渲染的分组数
+const DUPE_PAGE_SIZE = 25;    // 每页渲染的分组数
 let dupeKeyword = '';         // 结果分组搜索词
 let dupeCheckedPaths = new Set(); // 勾选待删的文件路径（跨页/搜索保持）
 let dupeHistoryList = [];     // 历史扫描列表缓存

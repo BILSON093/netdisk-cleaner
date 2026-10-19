@@ -268,7 +268,7 @@ app.post('/api/files/mkdir', async (req, res) => {
 // 开始检测任务
 app.post('/api/check/start', async (req, res) => {
     try {
-        const { accountId, dir = '/', includeKeywords = '', excludeKeywords = '', concurrency = 3, delay = 1000, autoDelete = false, movePath = '' } = req.body;
+        const { accountId, dir = '/', includeKeywords = '', excludeKeywords = '', delay = 1000, autoDelete = false, movePath = '' } = req.body;
         const account = db.getAccount(accountId);
         if (!account) {
             return res.json({ success: false, message: '账号不存在' });
@@ -290,7 +290,6 @@ app.post('/api/check/start', async (req, res) => {
             dir,
             includeKeywords: includeKeywords ? includeKeywords.split(/[,，]/).filter(Boolean) : [],
             excludeKeywords: excludeKeywords ? excludeKeywords.split(/[,，]/).filter(Boolean) : [],
-            concurrency: parseInt(concurrency) || 3,
             delay: parseInt(delay) || 1000,
             autoDelete: !!autoDelete,
             movePath: movePath || ''

@@ -152,16 +152,25 @@ function renderAccounts() {
 }
 
 function updateAccountSelects() {
-    const options = accounts.map(acc => 
+    const options = accounts.map(acc =>
         `<option value="${acc.id}">${escapeHtml(acc.name)}</option>`
     ).join('');
-    
+
     const selects = ['check-account', 'file-account', 'violation-account-filter', 'dupe-account'];
     selects.forEach(id => {
         const select = document.getElementById(id);
         if (select) {
+            const current = select.value;
             const firstOption = select.querySelector('option');
             select.innerHTML = firstOption.outerHTML + options;
+
+            // 保留原选择；没有则默认选中第一个账号，避免每次切页重选
+            if (current && accounts.some(a => a.id == current)) {
+                select.value = current;
+            } else if (accounts.length > 0) {
+                select.value = accounts[0].id;
+                select.dispatchEvent(new Event('change'));
+            }
         }
     });
 }
@@ -336,23 +345,21 @@ async function startCheck() {
     }
     
     const dir = document.getElementById('check-dir').value.trim() || '/';
-    const concurrency = document.getElementById('check-concurrency').value;
     const delay = document.getElementById('check-delay').value;
     const includeKeywords = document.getElementById('check-include').value;
     const excludeKeywords = document.getElementById('check-exclude').value;
-    
+
     const action = document.querySelector('input[name="check-action"]:checked').value;
     const autoDelete = action === 'delete';
     const movePath = action === 'move' ? document.getElementById('check-move-path').value.trim() : '';
-    
+
     const btn = document.getElementById('btn-start-check');
     btn.disabled = true;
-    
+
     try {
         const res = await API.post('/api/check/start', {
             accountId,
             dir,
-            concurrency,
             delay,
             includeKeywords,
             excludeKeywords,

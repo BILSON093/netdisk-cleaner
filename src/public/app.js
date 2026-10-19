@@ -619,6 +619,49 @@ function selectDir(path) {
     showToast('已选择目录: ' + path, 'success');
 }
 
+// ========== 删除任务（带进度）==========
+
+// 启动删除任务并轮询进度，进度实时显示在按钮上
+async function runDeleteWithProgress(url, body, btn, onDone) {
+    btn.disabled = true;
+    const originalHtml = btn.innerHTML;
+    try {
+        const res = await API.post(url, body);
+        if (!res.success) {
+            showToast(res.message || '删除失败', 'error');
+            return;
+        }
+        if (!res.data.taskId) {
+            showToast(res.data.message || '没有待删除的文件', 'info');
+            return;
+        }
+        const taskId = res.data.taskId;
+
+        while (true) {
+            await new Promise(s => setTimeout(s, 800));
+            try {
+                const p = await API.get(`/api/delete/progress/${taskId}`);
+                if (!p.success) break;
+                const d = p.data;
+                btn.innerHTML = `<span>🗑️</span> 删除中 ${d.processed}/${d.total}${d.failed ? `（失败 ${d.failed}）` : ''}`;
+                if (d.done) {
+                    showToast(`删除完成：成功 ${d.deleted} 个${d.failed ? `，失败 ${d.failed} 个` : ''}`,
+                        d.failed > 0 ? 'warning' : 'success');
+                    break;
+                }
+            } catch (e) {
+                break;
+            }
+        }
+        onDone && onDone();
+    } catch (e) {
+        showToast('删除失败: ' + e.message, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = originalHtml;
+    }
+}
+
 // ========== 违规记录 ==========
 
 let violationsPage = 1;
@@ -626,9 +669,11 @@ const violationsPageSize = 50;
 
 async function loadViolations() {
     const accountId = document.getElementById('violation-account-filter').value;
+    const keyword = document.getElementById('violation-search').value.trim();
     let url = `/api/violations?page=${violationsPage}&pageSize=${violationsPageSize}`;
     if (accountId) url += `&accountId=${accountId}`;
-    
+    if (keyword) url += `&keyword=${encodeURIComponent(keyword)}`;
+
     try {
         const res = await API.get(url);
         if (res.success) {
@@ -700,6 +745,16 @@ document.getElementById('violation-account-filter').addEventListener('change', (
     loadViolations();
 });
 
+// 搜索框防抖：输入停顿 300ms 后触发查询
+let violationSearchTimer = null;
+document.getElementById('violation-search').addEventListener('input', () => {
+    clearTimeout(violationSearchTimer);
+    violationSearchTimer = setTimeout(() => {
+        violationsPage = 1;
+        loadViolations();
+    }, 300);
+});
+
 document.getElementById('check-all-violations').addEventListener('change', (e) => {
     document.querySelectorAll('.violation-check').forEach(cb => {
         cb.checked = e.target.checked;
@@ -708,13 +763,15 @@ document.getElementById('check-all-violations').addEventListener('change', (e) =
 
 document.getElementById('btn-export-violations').addEventListener('click', () => {
     const accountId = document.getElementById('violation-account-filter').value;
+    const keyword = document.getElementById('violation-search').value.trim();
     let url = `/api/violations/export?format=csv`;
     if (accountId) url += `&accountId=${accountId}`;
+    if (keyword) url += `&keyword=${encodeURIComponent(keyword)}`;
     window.open(url, '_blank');
 });
 
 // 一键删除违规文件（从网盘删除，移入回收站）
-document.getElementById('btn-delete-violation-files').addEventListener('click', async () => {
+document.getElementById('btn-delete-violation-files').addEventListener('click', async (e) => {
     const accountId = document.getElementById('violation-account-filter').value;
     if (!accountId) {
         showToast('请先在左上角筛选出要操作的账号', 'error');
@@ -725,18 +782,7 @@ document.getElementById('btn-delete-violation-files').addEventListener('click', 
     const scope = selected.length > 0 ? `选中的 ${selected.length} 个` : '该账号下全部未删除的';
     if (!confirm(`确定要从百度网盘中删除${scope}违规文件吗？\n\n文件将移入网盘回收站，回收站清空后不可恢复！`)) return;
 
-    try {
-        showToast('正在删除，请稍候…', 'info');
-        const res = await API.post('/api/violations/delete-files', { accountId, ids: selected });
-        if (res.success) {
-            showToast(`删除完成：成功 ${res.data.deleted} 个，失败 ${res.data.failed} 个`, res.data.failed > 0 ? 'error' : 'success');
-            loadViolations();
-        } else {
-            showToast(res.message || '删除失败', 'error');
-        }
-    } catch (e) {
-        showToast('删除失败: ' + e.message, 'error');
-    }
+    await runDeleteWithProgress('/api/violations/delete-files', { accountId, ids: selected }, e.currentTarget, loadViolations);
 });
 
 document.getElementById('btn-clear-violations').addEventListener('click', async () => {
@@ -912,6 +958,10 @@ function checkThisFile(path) {
 let dupeTaskId = null;
 let dupePollTimer = null;
 let dupeCurrentScan = null;   // 当前查看的扫描快照 {id, account_id, ...}
+let dupeGroupsPage = 1;       // 结果分组当前页
+const DUPE_PAGE_SIZE = 50;    // 每页渲染的分组数
+let dupeKeyword = '';         // 结果分组搜索词
+let dupeCheckedPaths = new Set(); // 勾选待删的文件路径（跨页/搜索保持）
 
 document.getElementById('btn-start-dupes').addEventListener('click', async () => {
     const accountId = document.getElementById('dupe-account').value;
@@ -1010,35 +1060,85 @@ async function removeDupeScan(id) {
         showToast('已删除', 'success');
         document.getElementById('dupe-results').style.display = 'none';
         dupeCurrentScan = null;
+        dupeCheckedPaths = new Set();
         loadDupeScans();
     }
 }
 
 // 查看某次扫描的完整结果
-async function viewDupeScan(id) {
+// keepSelection=true 时保留当前勾选（删除后刷新用），否则重置为默认勾选
+async function viewDupeScan(id, keepSelection = false) {
     const res = await API.get(`/api/dupes/scans/${id}`);
     if (!res.success) {
         showToast(res.message || '加载失败', 'error');
         return;
     }
     dupeCurrentScan = res.data;
-    renderDupeResults(res.data);
+
+    if (!keepSelection) {
+        // 默认勾选：每组除「推荐保留」外未删除的文件
+        dupeCheckedPaths = new Set();
+        for (const g of dupeCurrentScan.groups) {
+            g.files.forEach((f, fi) => {
+                if (fi !== 0 && !f.deleted) dupeCheckedPaths.add(f.path);
+            });
+        }
+        dupeGroupsPage = 1;
+        dupeKeyword = '';
+        document.getElementById('dupe-search').value = '';
+    } else {
+        // 已删除的文件从勾选集中移除
+        for (const g of dupeCurrentScan.groups) {
+            for (const f of g.files) {
+                if (f.deleted) dupeCheckedPaths.delete(f.path);
+            }
+        }
+    }
+
+    renderDupeResults();
 }
 
-function renderDupeResults(scan) {
+// 当前过滤后的分组列表
+function getFilteredDupeGroups() {
+    if (!dupeCurrentScan) return [];
+    const kw = dupeKeyword.toLowerCase();
+    if (!kw) return dupeCurrentScan.groups;
+    return dupeCurrentScan.groups.filter(g =>
+        g.files.some(f =>
+            (f.filename || '').toLowerCase().includes(kw) ||
+            (f.path || '').toLowerCase().includes(kw)
+        )
+    );
+}
+
+function renderDupeResults() {
+    const scan = dupeCurrentScan;
+    if (!scan) return;
+
     document.getElementById('dupe-results').style.display = '';
     document.getElementById('dupe-stat-groups').textContent = scan.stats.groups;
     document.getElementById('dupe-stat-files').textContent = scan.stats.files;
     document.getElementById('dupe-stat-reclaim').textContent = formatSize(scan.stats.reclaimable);
 
     const container = document.getElementById('dupe-groups');
-    if (scan.groups.length === 0) {
-        container.innerHTML = '<div class="card"><p class="text-muted text-center">没有发现重复文件</p></div>';
+    const filtered = getFilteredDupeGroups();
+
+    if (filtered.length === 0) {
+        container.innerHTML = `<div class="card"><p class="text-muted text-center">${dupeKeyword ? '没有匹配的重复组' : '没有发现重复文件'}</p></div>`;
+        renderDupePagination(0);
         updateDupeCheckedCount();
         return;
     }
 
-    container.innerHTML = scan.groups.map((g, gi) => `
+    // 分页（只渲染当前页的分组，避免大数据量卡死页面）
+    const totalPages = Math.ceil(filtered.length / DUPE_PAGE_SIZE);
+    if (dupeGroupsPage > totalPages) dupeGroupsPage = totalPages;
+    const offset = (dupeGroupsPage - 1) * DUPE_PAGE_SIZE;
+    const pageGroups = filtered.slice(offset, offset + DUPE_PAGE_SIZE);
+
+    container.innerHTML = pageGroups.map((g, pi) => {
+        const gi = offset + pi;
+        return `
         <div class="card dupe-group">
             <div class="dupe-group-header">
                 <span>#${gi + 1} ${escapeHtml(g.files[0].filename)}</span>
@@ -1062,7 +1162,7 @@ function renderDupeResults(scan) {
                             <tr class="${f.deleted ? 'dupe-row-deleted' : ''}">
                                 <td>
                                     <input type="checkbox" class="dupe-check" data-path="${escapeHtml(f.path)}"
-                                        ${!isKeep && !f.deleted ? 'checked' : ''} ${f.deleted ? 'disabled' : ''}>
+                                        ${dupeCheckedPaths.has(f.path) && !f.deleted ? 'checked' : ''} ${f.deleted ? 'disabled' : ''}>
                                 </td>
                                 <td class="filename-cell" title="${escapeHtml(f.path)}">${getFileIcon(f.filename, 0)} ${escapeHtml(f.filename)}</td>
                                 <td class="filename-cell" title="${escapeHtml(f.path)}">${escapeHtml(f.path)}</td>
@@ -1076,35 +1176,82 @@ function renderDupeResults(scan) {
                     </tbody>
                 </table>
             </div>
-        </div>
-    `).join('');
+        </div>`;
+    }).join('');
 
+    renderDupePagination(filtered.length);
     updateDupeCheckedCount();
 }
 
-// 勾选计数（事件委托）
+function renderDupePagination(filteredCount) {
+    const container = document.getElementById('dupe-pagination');
+    const totalPages = Math.ceil(filteredCount / DUPE_PAGE_SIZE);
+
+    if (totalPages <= 1) {
+        container.innerHTML = filteredCount > 0 ? `<span style="color: var(--text-tertiary);">共 ${filteredCount} 组</span>` : '';
+        return;
+    }
+
+    const page = dupeGroupsPage;
+    let html = `<button ${page <= 1 ? 'disabled' : ''} onclick="goToDupePage(${page - 1})">上一页</button>`;
+
+    const start = Math.max(1, page - 2);
+    const end = Math.min(totalPages, page + 2);
+    for (let i = start; i <= end; i++) {
+        html += `<button class="${i === page ? 'active' : ''}" onclick="goToDupePage(${i})">${i}</button>`;
+    }
+
+    html += `<button ${page >= totalPages ? 'disabled' : ''} onclick="goToDupePage(${page + 1})">下一页</button>`;
+    html += `<span style="margin-left: 10px; color: var(--text-tertiary);">共 ${filteredCount} 组</span>`;
+
+    container.innerHTML = html;
+}
+
+function goToDupePage(page) {
+    dupeGroupsPage = page;
+    renderDupeResults();
+    document.getElementById('dupe-results').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+// 搜索过滤（防抖）
+let dupeSearchTimer = null;
+document.getElementById('dupe-search').addEventListener('input', (e) => {
+    clearTimeout(dupeSearchTimer);
+    dupeSearchTimer = setTimeout(() => {
+        dupeKeyword = e.target.value.trim();
+        dupeGroupsPage = 1;
+        renderDupeResults();
+    }, 300);
+});
+
+// 勾选变化（事件委托）：勾选状态存入 Set，翻页/搜索后不丢失
 document.getElementById('dupe-groups').addEventListener('change', (e) => {
-    if (e.target.classList.contains('dupe-check')) updateDupeCheckedCount();
+    if (!e.target.classList.contains('dupe-check')) return;
+    const path = e.target.dataset.path;
+    if (e.target.checked) {
+        dupeCheckedPaths.add(path);
+    } else {
+        dupeCheckedPaths.delete(path);
+    }
+    updateDupeCheckedCount();
 });
 
 function updateDupeCheckedCount() {
-    const checked = document.querySelectorAll('.dupe-check:checked').length;
-    document.getElementById('dupes-checked-count').textContent = checked;
-    document.getElementById('btn-dupes-delete').style.display = checked > 0 ? '' : 'none';
+    document.getElementById('dupes-checked-count').textContent = dupeCheckedPaths.size;
+    document.getElementById('btn-dupes-delete').style.display = dupeCheckedPaths.size > 0 ? '' : 'none';
 }
 
 // 一键删除选中的重复文件
-document.getElementById('btn-dupes-delete').addEventListener('click', async () => {
+document.getElementById('btn-dupes-delete').addEventListener('click', async (e) => {
     if (!dupeCurrentScan) return;
 
-    const paths = [...document.querySelectorAll('.dupe-check:checked')].map(cb => cb.dataset.path);
+    const paths = [...dupeCheckedPaths];
     if (paths.length === 0) return;
 
-    // 每组至少保留1个未勾选的，防误删整组
-    const groups = document.querySelectorAll('.dupe-group');
-    for (const g of groups) {
-        const boxes = [...g.querySelectorAll('.dupe-check:not(:disabled)')];
-        if (boxes.length > 0 && boxes.every(cb => cb.checked)) {
+    // 每组至少保留1个未勾选的，防误删整组（基于完整数据校验，不受分页影响）
+    for (const g of dupeCurrentScan.groups) {
+        const alive = g.files.filter(f => !f.deleted);
+        if (alive.length > 0 && alive.every(f => dupeCheckedPaths.has(f.path))) {
             showToast('每组至少要保留 1 个文件，请取消某组的一个勾选', 'error');
             return;
         }
@@ -1112,24 +1259,11 @@ document.getElementById('btn-dupes-delete').addEventListener('click', async () =
 
     if (!confirm(`确定删除选中的 ${paths.length} 个重复文件？\n文件将移入网盘回收站。`)) return;
 
-    const btn = document.getElementById('btn-dupes-delete');
-    btn.disabled = true;
-    try {
-        const res = await API.post('/api/dupes/delete', {
-            accountId: dupeCurrentScan.account_id,
-            scanId: dupeCurrentScan.id,
-            paths
-        });
-        if (res.success) {
-            showToast(`已删除 ${res.data.deleted} 个${res.data.failed ? `，失败 ${res.data.failed} 个` : ''}`,
-                res.data.failed ? 'warning' : 'success');
-            viewDupeScan(dupeCurrentScan.id);   // 刷新标记
-        } else {
-            showToast(res.message || '删除失败', 'error');
-        }
-    } finally {
-        btn.disabled = false;
-    }
+    const scanId = dupeCurrentScan.id;
+    const accountId = dupeCurrentScan.account_id;
+    await runDeleteWithProgress('/api/dupes/delete', { accountId, scanId, paths }, e.currentTarget, () => {
+        viewDupeScan(scanId, true);   // 刷新标记，保留剩余勾选
+    });
 });
 
 // ========== 辅助函数 ==========

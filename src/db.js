@@ -1,6 +1,26 @@
 const fs = require('fs');
 const path = require('path');
 
+// 违规记录通用过滤：账号 / 任务 / 关键词（文件名或路径，不区分大小写）
+function filterViolationRecords(records, { accountId, taskId, keyword } = {}) {
+    let result = [...records];
+    if (accountId) {
+        result = result.filter(r => r.account_id == accountId);
+    }
+    if (taskId) {
+        result = result.filter(r => r.task_id == taskId);
+    }
+    if (keyword) {
+        const kw = String(keyword).toLowerCase();
+        result = result.filter(r =>
+            (r.filename || '').toLowerCase().includes(kw) ||
+            (r.path || '').toLowerCase().includes(kw)
+        );
+    }
+    result.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+    return result;
+}
+
 class AppDatabase {
     constructor(dataDir) {
         this.dataDir = dataDir;
@@ -118,37 +138,18 @@ class AppDatabase {
         return newRecord.id;
     }
 
-    getViolationRecords({ accountId, taskId, page = 1, pageSize = 50 } = {}) {
-        let records = [...this.data.violationRecords];
-        
-        if (accountId) {
-            records = records.filter(r => r.account_id == accountId);
-        }
-        if (taskId) {
-            records = records.filter(r => r.task_id == taskId);
-        }
-        
-        records.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-        
+    getViolationRecords({ accountId, taskId, keyword, page = 1, pageSize = 50 } = {}) {
+        let records = filterViolationRecords(this.data.violationRecords, { accountId, taskId, keyword });
+
         const total = records.length;
         const offset = (page - 1) * pageSize;
         const paginated = records.slice(offset, offset + pageSize);
-        
+
         return { records: paginated, total, page, pageSize };
     }
 
-    getAllViolationRecords({ accountId, taskId } = {}) {
-        let records = [...this.data.violationRecords];
-        
-        if (accountId) {
-            records = records.filter(r => r.account_id == accountId);
-        }
-        if (taskId) {
-            records = records.filter(r => r.task_id == taskId);
-        }
-        
-        records.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-        return records;
+    getAllViolationRecords({ accountId, taskId, keyword } = {}) {
+        return filterViolationRecords(this.data.violationRecords, { accountId, taskId, keyword });
     }
 
     deleteViolationRecord(id) {

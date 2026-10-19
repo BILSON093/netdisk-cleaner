@@ -206,6 +206,7 @@
                 <div class="page-header">
                     <h2>违规记录</h2>
                     <div class="header-actions">
+                        <input type="text" id="violation-search" class="form-control form-control-sm" placeholder="搜索文件名/路径" style="width: 180px;">
                         <select id="violation-account-filter" class="form-control form-control-sm">
                             <option value="">全部账号</option>
                         </select>
@@ -333,8 +334,12 @@
                             </div>
                         </div>
                         <p class="form-hint" style="margin-top:8px;">每组默认保留「最早修改」的 1 个，其余勾选待删；可手动调整勾选。删除后移入网盘回收站。</p>
+                        <div style="margin-top: 12px;">
+                            <input type="text" id="dupe-search" class="form-control form-control-sm" placeholder="搜索文件名/路径，筛选重复组" style="max-width: 280px;">
+                        </div>
                     </div>
                     <div id="dupe-groups"></div>
+                    <div class="pagination" id="dupe-pagination"></div>
                 </div>
             </section>
 

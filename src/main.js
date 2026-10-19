@@ -37,6 +37,61 @@ const checkTasks = new Map();
 // 存储重复文件扫描任务（进行中）
 const dupeTasks = new Map();
 
+// 存储删除任务（违规文件删除 / 重复文件删除共用）
+// taskId → { total, processed, deleted, failed, current, done }
+const deleteTasks = new Map();
+
+// 通用删除执行器：分批删除 + 失败逐个重试，实时更新进度
+async function runDeleteTask(taskId, api, items, onSuccess, onFail) {
+    const task = deleteTasks.get(taskId);
+    const CHUNK = 50; // 网盘删除接口单批数量
+    try {
+        for (let i = 0; i < items.length; i += CHUNK) {
+            const chunk = items.slice(i, i + CHUNK);
+            const result = await api.deleteFiles(chunk.map(it => ({ path: it.path })));
+            if (result.success) {
+                onSuccess(chunk);
+                task.deleted += chunk.length;
+            } else {
+                // 批量失败 → 逐个重试，定位失败项
+                for (const it of chunk) {
+                    const single = await api.deleteFiles([{ path: it.path }]);
+                    if (single.success) {
+                        onSuccess([it]);
+                        task.deleted++;
+                    } else {
+                        onFail(it);
+                        task.failed++;
+                    }
+                    task.current = it.path;
+                    task.processed = task.deleted + task.failed;
+                    await new Promise(s => setTimeout(s, 300));
+                }
+            }
+            task.processed = task.deleted + task.failed;
+            if (i + CHUNK < items.length) {
+                await new Promise(s => setTimeout(s, 500));
+            }
+        }
+    } catch (e) {
+        task.error = e.message;
+    } finally {
+        task.done = true;
+        task.current = '';
+        // 完成后保留 10 分钟供前端查询，之后清理
+        setTimeout(() => deleteTasks.delete(taskId), 600000);
+    }
+}
+
+// 查询删除进度
+app.get('/api/delete/progress/:taskId', (req, res) => {
+    const task = deleteTasks.get(req.params.taskId);
+    if (!task) {
+        return res.json({ success: false, message: '任务不存在或已过期' });
+    }
+    res.json({ success: true, data: task });
+});
+
 app.use(express.json({ limit: '50mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -425,8 +480,8 @@ app.post('/api/check/stop/:taskId', (req, res) => {
 // 获取和谐文件记录
 app.get('/api/violations', (req, res) => {
     try {
-        const { accountId, taskId, page = 1, pageSize = 50 } = req.query;
-        const result = db.getViolationRecords({ accountId, taskId, page: parseInt(page), pageSize: parseInt(pageSize) });
+        const { accountId, taskId, keyword, page = 1, pageSize = 50 } = req.query;
+        const result = db.getViolationRecords({ accountId, taskId, keyword, page: parseInt(page), pageSize: parseInt(pageSize) });
         res.json({ success: true, data: result });
     } catch (e) {
         res.json({ success: false, message: e.message });
@@ -454,7 +509,7 @@ app.post('/api/violations/clear', (req, res) => {
     }
 });
 
-// 一键删除违规文件（从百度网盘删除，移入网盘回收站）
+// 一键删除违规文件（从百度网盘删除，移入网盘回收站）— 任务式，前端轮询进度
 app.post('/api/violations/delete-files', async (req, res) => {
     try {
         const { accountId, ids } = req.body;
@@ -472,37 +527,21 @@ app.post('/api/violations/delete-files', async (req, res) => {
         records = records.filter(r => r.status !== 'deleted');
 
         if (records.length === 0) {
-            return res.json({ success: true, data: { deleted: 0, failed: 0, message: '没有待删除的文件' } });
+            return res.json({ success: true, data: { taskId: null, deleted: 0, failed: 0, message: '没有待删除的文件' } });
         }
 
-        let deleted = 0, failed = 0;
-        const CHUNK = 50; // 网盘删除接口单批数量
-        for (let i = 0; i < records.length; i += CHUNK) {
-            const chunk = records.slice(i, i + CHUNK);
-            const result = await api.deleteFiles(chunk.map(r => ({ path: r.path })));
-            if (result.success) {
-                for (const r of chunk) db.updateViolationRecord(r.id, { status: 'deleted' });
-                deleted += chunk.length;
-            } else {
-                // 批量失败 → 逐个重试，定位失败项
-                for (const r of chunk) {
-                    const single = await api.deleteFiles([{ path: r.path }]);
-                    if (single.success) {
-                        db.updateViolationRecord(r.id, { status: 'deleted' });
-                        deleted++;
-                    } else {
-                        db.updateViolationRecord(r.id, { status: 'delete_failed' });
-                        failed++;
-                    }
-                    await new Promise(s => setTimeout(s, 300));
-                }
-            }
-            if (i + CHUNK < records.length) {
-                await new Promise(s => setTimeout(s, 500));
-            }
-        }
+        const taskId = 'del_' + Date.now();
+        deleteTasks.set(taskId, { total: records.length, processed: 0, deleted: 0, failed: 0, current: '', done: false });
 
-        res.json({ success: true, data: { deleted, failed } });
+        runDeleteTask(
+            taskId,
+            api,
+            records.map(r => ({ id: r.id, path: r.path })),
+            (chunk) => chunk.forEach(it => db.updateViolationRecord(it.id, { status: 'deleted' })),
+            (it) => db.updateViolationRecord(it.id, { status: 'delete_failed' })
+        );
+
+        res.json({ success: true, data: { taskId, total: records.length } });
     } catch (e) {
         res.json({ success: false, message: e.message });
     }
@@ -511,8 +550,8 @@ app.post('/api/violations/delete-files', async (req, res) => {
 // 导出和谐文件记录
 app.get('/api/violations/export', (req, res) => {
     try {
-        const { accountId, taskId, format = 'csv' } = req.query;
-        const records = db.getAllViolationRecords({ accountId, taskId });
+        const { accountId, taskId, keyword, format = 'csv' } = req.query;
+        const records = db.getAllViolationRecords({ accountId, taskId, keyword });
         
         if (format === 'csv') {
             const header = '文件名,路径,大小,原因,状态,检测时间\n';
@@ -627,7 +666,7 @@ app.delete('/api/dupes/scans/:id', (req, res) => {
     }
 });
 
-// 删除选中的重复文件（移入网盘回收站），并更新快照中的已删标记
+// 删除选中的重复文件（移入网盘回收站），完成后更新快照中的已删标记 — 任务式
 app.post('/api/dupes/delete', async (req, res) => {
     try {
         const { accountId, scanId, paths } = req.body;
@@ -639,34 +678,24 @@ app.post('/api/dupes/delete', async (req, res) => {
         }
 
         const api = getApi(accountId);
-        const CHUNK = 50;
         const succeeded = [];
-        let failed = 0;
 
-        for (let i = 0; i < paths.length; i += CHUNK) {
-            const chunk = paths.slice(i, i + CHUNK);
-            const result = await api.deleteFiles(chunk.map(p => ({ path: p })));
-            if (result.success) {
-                succeeded.push(...chunk);
-            } else {
-                // 批量失败 → 逐个重试，定位失败项
-                for (const p of chunk) {
-                    const single = await api.deleteFiles([{ path: p }]);
-                    if (single.success) succeeded.push(p);
-                    else failed++;
-                    await new Promise(s => setTimeout(s, 300));
-                }
+        const taskId = 'del_' + Date.now();
+        deleteTasks.set(taskId, { total: paths.length, processed: 0, deleted: 0, failed: 0, current: '', done: false });
+
+        runDeleteTask(
+            taskId,
+            api,
+            paths.map(p => ({ path: p })),
+            (chunk) => succeeded.push(...chunk.map(it => it.path)),
+            () => {}
+        ).then(() => {
+            if (scanId && succeeded.length > 0) {
+                db.markDupeFilesDeleted(scanId, succeeded);
             }
-            if (i + CHUNK < paths.length) {
-                await new Promise(s => setTimeout(s, 500));
-            }
-        }
+        });
 
-        if (scanId && succeeded.length > 0) {
-            db.markDupeFilesDeleted(scanId, succeeded);
-        }
-
-        res.json({ success: true, data: { requested: paths.length, deleted: succeeded.length, failed } });
+        res.json({ success: true, data: { taskId, total: paths.length } });
     } catch (e) {
         res.json({ success: false, message: e.message });
     }

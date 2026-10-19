@@ -1,0 +1,14 @@
+# 依赖
+node_modules/
+
+# 运行时数据（含账号 Cookie，切勿提交！）
+data/
+
+# 打包产物
+dist/
+
+# 日志与临时文件
+*.log
+*.tmp
+.DS_Store
+Thumbs.db

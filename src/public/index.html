@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>百度网盘和谐文件清理工具 - 免费开源版</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="app">
+        <!-- 侧边栏 -->
+        <aside class="sidebar">
+            <div class="logo">
+                <div class="logo-icon">🗑️</div>
+                <div class="logo-text">
+                    <h1>和谐文件清理</h1>
+                    <p>免费开源版</p>
+                </div>
+            </div>
+            
+            <nav class="nav">
+                <div class="nav-item active" data-tab="accounts">
+                    <span class="nav-icon">👤</span>
+                    <span>账号管理</span>
+                </div>
+                <div class="nav-item" data-tab="check">
+                    <span class="nav-icon">🔍</span>
+                    <span>检测和谐</span>
+                </div>
+                <div class="nav-item" data-tab="violations">
+                    <span class="nav-icon">⚠️</span>
+                    <span>违规记录</span>
+                </div>
+                <div class="nav-item" data-tab="dupes">
+                    <span class="nav-icon">📑</span>
+                    <span>重复文件</span>
+                </div>
+                <div class="nav-item" data-tab="files">
+                    <span class="nav-icon">📁</span>
+                    <span>文件浏览</span>
+                </div>
+                <div class="nav-item" data-tab="settings">
+                    <span class="nav-icon">⚙️</span>
+                    <span>设置</span>
+                </div>
+            </nav>
+            
+            <div class="sidebar-footer">
+                <p>v1.0.0 | 免费开源</p>
+            </div>
+        </aside>
+
+        <!-- 主内容区 -->
+        <main class="main">
+            <!-- 账号管理 -->
+            <section class="tab-content active" id="tab-accounts">
+                <div class="page-header">
+                    <h2>账号管理</h2>
+                    <button class="btn btn-primary" id="btn-add-account">
+                        <span>➕</span> 添加账号
+                    </button>
+                </div>
+                
+                <div class="card">
+                    <div id="accounts-list" class="accounts-list">
+                        <div class="empty-state">
+                            <div class="empty-icon">👤</div>
+                            <p>暂无账号，点击上方按钮添加</p>
+                            <p class="empty-hint">需要提供百度网盘 Cookies 进行登录</p>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 检测和谐 -->
+            <section class="tab-content" id="tab-check">
+                <div class="page-header">
+                    <h2>和谐文件检测</h2>
+                </div>
+                
+                <div class="card">
+                    <div class="form-group">
+                        <label>选择账号</label>
+                        <select id="check-account" class="form-control">
+                            <option value="">请先添加账号</option>
+                        </select>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>检测目录</label>
+                        <div class="input-group">
+                            <input type="text" id="check-dir" class="form-control" value="/" placeholder="要检测的目录路径">
+                            <button class="btn btn-outline" id="btn-select-dir">选择目录</button>
+                        </div>
+                    </div>
+                    
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>并发线程数</label>
+                            <input type="number" id="check-concurrency" class="form-control" value="3" min="1" max="20">
+                        </div>
+                        <div class="form-group">
+                            <label>检测间隔(ms)</label>
+                            <input type="number" id="check-delay" class="form-control" value="1000" min="0" step="100">
+                        </div>
+                    </div>
+                    
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>包含关键词</label>
+                            <input type="text" id="check-include" class="form-control" placeholder="多个关键词用逗号分隔">
+                            <small class="form-hint">只检测文件名包含这些关键词的文件</small>
+                        </div>
+                        <div class="form-group">
+                            <label>排除关键词</label>
+                            <input type="text" id="check-exclude" class="form-control" placeholder="多个关键词用逗号分隔">
+                            <small class="form-hint">文件名包含这些关键词的文件跳过检测</small>
+                        </div>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>检测后操作</label>
+                        <div class="radio-group">
+                            <label class="radio">
+                                <input type="radio" name="check-action" value="none" checked>
+                                <span>仅检测，不操作</span>
+                            </label>
+                            <label class="radio">
+                                <input type="radio" name="check-action" value="move">
+                                <span>移动到指定文件夹</span>
+                            </label>
+                            <label class="radio">
+                                <input type="radio" name="check-action" value="delete">
+                                <span>自动删除违规文件</span>
+                            </label>
+                        </div>
+                    </div>
+                    
+                    <div class="form-group" id="move-path-group" style="display:none;">
+                        <label>移动目标文件夹</label>
+                        <input type="text" id="check-move-path" class="form-control" value="/已和谐文件" placeholder="目标文件夹路径">
+                    </div>
+                    
+                    <div class="form-actions">
+                        <button class="btn btn-primary btn-lg" id="btn-start-check">
+                            <span>▶️</span> 开始检测
+                        </button>
+                        <button class="btn btn-warning" id="btn-pause-check" style="display:none;">
+                            <span>⏸️</span> 暂停
+                        </button>
+                        <button class="btn btn-danger" id="btn-stop-check" style="display:none;">
+                            <span>⏹️</span> 停止
+                        </button>
+                    </div>
+                </div>
+                
+                <!-- 检测进度 -->
+                <div class="card" id="progress-card" style="display:none;">
+                    <h3>检测进度</h3>
+                    <div class="progress-bar">
+                        <div class="progress-fill" id="progress-fill"></div>
+                    </div>
+                    <div class="progress-stats">
+                        <div class="stat">
+                            <span class="stat-label">总计</span>
+                            <span class="stat-value" id="stat-total">0</span>
+                        </div>
+                        <div class="stat">
+                            <span class="stat-label">已检测</span>
+                            <span class="stat-value" id="stat-checked">0</span>
+                        </div>
+                        <div class="stat stat-danger">
+                            <span class="stat-label">违规</span>
+                            <span class="stat-value" id="stat-violation">0</span>
+                        </div>
+                        <div class="stat stat-success">
+                            <span class="stat-label">正常</span>
+                            <span class="stat-value" id="stat-normal">0</span>
+                        </div>
+                        <div class="stat stat-warning">
+                            <span class="stat-label">失败</span>
+                            <span class="stat-value" id="stat-failed">0</span>
+                        </div>
+                    </div>
+                    
+                    <!-- 实时违规列表 -->
+                    <div class="violation-preview">
+                        <h4>违规文件列表</h4>
+                        <div class="table-container">
+                            <table class="table" id="violation-preview-table">
+                                <thead>
+                                    <tr>
+                                        <th>文件名</th>
+                                        <th>路径</th>
+                                        <th>大小</th>
+                                        <th>原因</th>
+                                        <th>状态</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="violation-preview-body">
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 违规记录 -->
+            <section class="tab-content" id="tab-violations">
+                <div class="page-header">
+                    <h2>违规记录</h2>
+                    <div class="header-actions">
+                        <select id="violation-account-filter" class="form-control form-control-sm">
+                            <option value="">全部账号</option>
+                        </select>
+                        <button class="btn btn-danger" id="btn-delete-violation-files">
+                            <span>🗑️</span> 删除违规文件
+                        </button>
+                        <button class="btn btn-outline" id="btn-export-violations">
+                            <span>📤</span> 导出
+                        </button>
+                        <button class="btn btn-danger" id="btn-clear-violations">
+                            <span>🗑️</span> 清空
+                        </button>
+                    </div>
+                </div>
+                
+                <div class="card">
+                    <div class="table-container">
+                        <table class="table" id="violations-table">
+                            <thead>
+                                <tr>
+                                    <th><input type="checkbox" id="check-all-violations"></th>
+                                    <th>文件名</th>
+                                    <th>路径</th>
+                                    <th>大小</th>
+                                    <th>原因</th>
+                                    <th>状态</th>
+                                    <th>检测时间</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="violations-body">
+                                <tr>
+                                    <td colspan="8" class="text-center text-muted">暂无记录</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <div class="pagination" id="violations-pagination"></div>
+                </div>
+            </section>
+
+            <!-- 重复文件 -->
+            <section class="tab-content" id="tab-dupes">
+                <div class="page-header">
+                    <h2>重复文件扫描</h2>
+                    <div class="header-actions">
+                        <button class="btn btn-danger" id="btn-dupes-delete" style="display:none;">
+                            <span>🗑️</span> 删除选中 (<span id="dupes-checked-count">0</span>)
+                        </button>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="form-group">
+                        <label>选择账号</label>
+                        <select id="dupe-account" class="form-control">
+                            <option value="">请先添加账号</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>扫描目录</label>
+                        <input type="text" id="dupe-dir" class="form-control" value="/" placeholder="要扫描的目录路径">
+                        <small class="form-hint">按 大小+MD5 判重，只调用列表接口，不触发下载限流</small>
+                    </div>
+                    <div class="form-actions">
+                        <button class="btn btn-primary btn-lg" id="btn-start-dupes">
+                            <span>▶️</span> 开始扫描
+                        </button>
+                        <button class="btn btn-danger" id="btn-stop-dupes" style="display:none;">
+                            <span>⏹️</span> 停止
+                        </button>
+                    </div>
+                </div>
+
+                <!-- 扫描进度 -->
+                <div class="card" id="dupe-progress-card" style="display:none;">
+                    <h3>扫描进度</h3>
+                    <div class="progress-stats">
+                        <div class="stat">
+                            <span class="stat-label">已收集文件</span>
+                            <span class="stat-value" id="dupe-stat-scanned">0</span>
+                        </div>
+                    </div>
+                    <p class="text-muted" id="dupe-current-dir" style="margin-top:8px;font-size:12px;word-break:break-all;"></p>
+                </div>
+
+                <!-- 历史扫描 -->
+                <div class="card" id="dupe-history-card">
+                    <h3>历史扫描</h3>
+                    <div class="table-container">
+                        <table class="table">
+                            <thead>
+                                <tr>
+                                    <th>时间</th>
+                                    <th>目录</th>
+                                    <th>文件数</th>
+                                    <th>重复组</th>
+                                    <th>可释放</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="dupe-history-body">
+                                <tr><td colspan="6" class="text-center text-muted">暂无扫描记录</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- 扫描结果 -->
+                <div id="dupe-results" style="display:none;">
+                    <div class="card">
+                        <h3>扫描结果</h3>
+                        <div class="progress-stats">
+                            <div class="stat">
+                                <span class="stat-label">重复组</span>
+                                <span class="stat-value" id="dupe-stat-groups">0</span>
+                            </div>
+                            <div class="stat stat-warning">
+                                <span class="stat-label">冗余文件</span>
+                                <span class="stat-value" id="dupe-stat-files">0</span>
+                            </div>
+                            <div class="stat stat-success">
+                                <span class="stat-label">可释放空间</span>
+                                <span class="stat-value" id="dupe-stat-reclaim">0</span>
+                            </div>
+                        </div>
+                        <p class="form-hint" style="margin-top:8px;">每组默认保留「最早修改」的 1 个，其余勾选待删；可手动调整勾选。删除后移入网盘回收站。</p>
+                    </div>
+                    <div id="dupe-groups"></div>
+                </div>
+            </section>
+
+            <!-- 文件浏览 -->
+            <section class="tab-content" id="tab-files">
+                <div class="page-header">
+                    <h2>文件浏览</h2>
+                    <div class="header-actions">
+                        <select id="file-account" class="form-control form-control-sm">
+                            <option value="">请选择账号</option>
+                        </select>
+                    </div>
+                </div>
+                
+                <div class="card">
+                    <div class="path-nav" id="path-nav">
+                        <span class="path-item" data-path="/">根目录</span>
+                    </div>
+                    
+                    <div class="table-container">
+                        <table class="table" id="files-table">
+                            <thead>
+                                <tr>
+                                    <th>名称</th>
+                                    <th>大小</th>
+                                    <th>修改时间</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="files-body">
+                                <tr>
+                                    <td colspan="4" class="text-center text-muted">请先选择账号</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 设置 -->
+            <section class="tab-content" id="tab-settings">
+                <div class="page-header">
+                    <h2>设置</h2>
+                </div>
+                
+                <div class="card">
+                    <h3>关于本软件</h3>
+                    <p>这是一个完全免费开源的百度网盘和谐文件清理工具，无需激活、无任何限制。</p>
+                    <ul class="about-list">
+                        <li>✅ 完全免费，无需激活</li>
+                        <li>✅ 开源透明，无后门</li>
+                        <li>✅ 支持多账号管理</li>
+                        <li>✅ 支持关键词过滤</li>
+                        <li>✅ 支持代理</li>
+                        <li>✅ 批量检测和清理</li>
+                    </ul>
+                    
+                    <h3 style="margin-top: 24px;">使用说明</h3>
+                    <ol class="help-list">
+                        <li>在"账号管理"中添加百度网盘账号（需要 Cookies）</li>
+                        <li>获取 Cookies 的方法：
+                            <ul>
+                                <li>打开浏览器，登录百度网盘网页版 (pan.baidu.com)</li>
+                                <li>按 F12 打开开发者工具</li>
+                                <li>切换到 Network（网络）标签</li>
+                                <li>刷新页面，点击任意一个请求</li>
+                                <li>在 Request Headers 中找到 Cookie，复制全部内容</li>
+                            </ul>
+                        </li>
+                        <li>在"检测和谐"中设置检测参数，开始检测</li>
+                        <li>检测完成后可在"违规记录"中查看和处理</li>
+                    </ol>
+                    
+                    <h3 style="margin-top: 24px;">免责声明</h3>
+                    <p class="text-muted">本软件仅供学习和个人使用，请遵守相关法律法规。使用本软件产生的一切后果由使用者自行承担。</p>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- 添加账号弹窗 -->
+    <div class="modal" id="modal-add-account">
+        <div class="modal-overlay"></div>
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>添加账号</h3>
+                <button class="modal-close" data-modal="modal-add-account">×</button>
+            </div>
+            <div class="modal-body">
+                <!-- 浏览器自动登录（推荐） -->
+                <div class="form-group" id="browser-login-box">
+                    <button class="btn btn-primary btn-block" id="btn-browser-login">
+                        🌐 浏览器自动登录（推荐）
+                    </button>
+                    <small class="form-hint">
+                        自动打开浏览器登录百度账号，登录成功后自动获取完整凭证，无需手动复制 Cookie
+                    </small>
+                    <div id="browser-login-status" class="browser-login-status" style="display:none;">
+                        <span class="spinner"></span>
+                        <span id="browser-login-text">等待登录...</span>
+                        <button class="btn btn-sm btn-outline" id="btn-browser-login-cancel">取消</button>
+                    </div>
+                </div>
+
+                <div class="divider"><span>或手动粘贴 Cookie</span></div>
+
+                <div class="form-group">
+                    <label>百度网盘 Cookies *</label>
+                    <textarea id="account-cookies" class="form-control" rows="6" placeholder="粘贴从浏览器获取的完整Cookie字符串"></textarea>
+                    <small class="form-hint">
+                        如何获取：登录 pan.baidu.com → F12 → Network → 刷新 → 点击发往 pan.baidu.com/api/ 的请求 → 复制 Request Headers 中的 Cookie（需包含 BDUSS、STOKEN、BAIDUID、ndus）
+                    </small>
+                </div>
+                <div class="form-group">
+                    <label>备注名称（可选）</label>
+                    <input type="text" id="account-name" class="form-control" placeholder="给这个账号起个名字">
+                </div>
+                <div class="form-group">
+                    <label>代理（可选）</label>
+                    <input type="text" id="account-proxy" class="form-control" placeholder="如: http://127.0.0.1:7890 或 socks://127.0.0.1:7890">
+                    <small class="form-hint">支持 http/https/socks5 代理</small>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-outline" data-modal="modal-add-account">取消</button>
+                <button class="btn btn-primary" id="btn-save-account">确认添加</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 选择目录弹窗 -->
+    <div class="modal" id="modal-select-dir">
+        <div class="modal-overlay"></div>
+        <div class="modal-content modal-lg">
+            <div class="modal-header">
+                <h3>选择目录</h3>
+                <button class="modal-close" data-modal="modal-select-dir">×</button>
+            </div>
+            <div class="modal-body">
+                <div class="path-nav" id="dir-select-nav">
+                    <span class="path-item" data-path="/">根目录</span>
+                </div>
+                <div class="table-container">
+                    <table class="table" id="dir-select-table">
+                        <thead>
+                            <tr>
+                                <th>名称</th>
+                                <th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="dir-select-body">
+                            <tr>
+                                <td colspan="2" class="text-center text-muted">请先选择账号</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-outline" data-modal="modal-select-dir">取消</button>
+                <button class="btn btn-primary" id="btn-confirm-dir">确认选择</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 提示框 -->
+    <div class="toast" id="toast"></div>
+
+    <script src="app.js"></script>
+</body>
+</html>

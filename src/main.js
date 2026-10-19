@@ -1,0 +1,722 @@
+const express = require('express');
+const path = require('path');
+const fs = require('fs');
+const { BaiduPanAPI } = require('./baidu-api');
+const { Database } = require('./db');
+const { ViolationChecker } = require('./violation-checker');
+const { DuplicateScanner } = require('./duplicate-scanner');
+const { loginSession } = require('./login-browser');
+
+const app = express();
+const PORT = process.env.PORT || 37471;
+
+// 获取应用程序基础目录（打包后为exe所在目录）
+function getAppDir() {
+    // pkg 环境下使用 exe 所在目录
+    if (process.pkg) {
+        return path.dirname(process.execPath);
+    }
+    return process.cwd();
+}
+
+// 数据目录
+const dataDir = path.join(getAppDir(), 'data');
+if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true });
+}
+
+// 初始化数据库
+const db = new Database(dataDir);
+
+// 存储活跃的API实例
+const apiInstances = new Map();
+
+// 存储检测任务
+const checkTasks = new Map();
+
+// 存储重复文件扫描任务（进行中）
+const dupeTasks = new Map();
+
+app.use(express.json({ limit: '50mb' }));
+app.use(express.static(path.join(__dirname, 'public')));
+
+// ========== 账号管理 ==========
+
+// 获取账号列表
+app.get('/api/accounts', (req, res) => {
+    try {
+        const accounts = db.getAccounts();
+        res.json({ success: true, data: accounts });
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
+});
+
+// 清洗Cookie字符串：去重、去除无效段、去除值两侧的引号
+function cleanCookies(raw) {
+    const parts = String(raw).split(';').map(s => s.trim()).filter(s => s && s.includes('='));
+    const map = new Map();
+    for (const p of parts) {
+        const i = p.indexOf('=');
+        const k = p.slice(0, i).trim();
+        if (!k || k.toLowerCase() === 'undefined') continue;
+        let v = p.slice(i + 1).trim();
+        if (v.startsWith('"') && v.endsWith('"')) v = v.slice(1, -1);
+        map.set(k, v);
+    }
+    return [...map.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
+// ==================== 浏览器自动登录 ====================
+
+// 启动浏览器登录
+app.post('/api/login/browser/start', async (req, res) => {
+    try {
+        const ok = await loginSession.start();
+        if (ok) {
+            res.json({ success: true, message: '浏览器已打开，请登录百度账号' });
+        } else {
+            res.json({ success: false, message: loginSession.message });
+        }
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
+});
+
+// 查询登录状态
+app.get('/api/login/browser/status', (req, res) => {
+    const s = loginSession.getStatus();
+    res.json({ success: true, data: s });
+});
+
+// 取消登录
+app.post('/api/login/browser/cancel', async (req, res) => {
+    await loginSession.cancel();
+    res.json({ success: true, message: '已取消' });
+});
+
+// ==================== 账号管理 ====================
+
+// 添加账号
+app.post('/api/accounts', async (req, res) => {
+    try {
+        const { name, proxy } = req.body;
+        let { cookies } = req.body;
+        if (!cookies) {
+            return res.json({ success: false, message: '请提供Cookies' });
+        }
+
+        cookies = cleanCookies(cookies);
+
+        const api = new BaiduPanAPI(cookies, proxy);
+        const userInfo = await api.getUserInfo();
+
+        if (!userInfo) {
+            return res.json({ success: false, message: 'Cookies无效或登录失败' });
+        }
+
+        const bdstoken = await api.getBdstoken();
+
+        // 用数据接口实测会话，避免 loginStatus 宽松校验造成的误判
+        const session = await api.validateSession();
+        if (!session.valid) {
+            return res.json({
+                success: false,
+                message: `Cookies已失效或不完整（${session.message || '身份验证失败'}）。请退出百度网盘重新登录后，复制完整Cookie（需包含BDUSS、STOKEN、BAIDUID、ndus等）再试`
+            });
+        }
+
+        const info = userInfo.login_info || userInfo;
+        const accountName = name || info.netdisk_name || info.username || '未知用户';
+
+        const accountId = db.addAccount({
+            name: accountName,
+            cookies: cookies,
+            bdstoken: bdstoken || '',
+            proxy: proxy || '',
+            baidu_name: info.baidu_name || '',
+            netdisk_name: info.netdisk_name || '',
+            uk: info.uk || ''
+        });
+
+        res.json({ success: true, data: { id: accountId, name: accountName, bdstoken } });
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
+});
+
+// 删除账号
+app.delete('/api/accounts/:id', (req, res) => {
+    try {
+        db.deleteAccount(req.params.id);
+        apiInstances.delete(req.params.id);
+        res.json({ success: true });
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
+});
+
+// 验证账号
+app.post('/api/accounts/:id/verify', async (req, res) => {
+    try {
+        const account = db.getAccount(req.params.id);
+        if (!account) {
+            return res.json({ success: false, message: '账号不存在' });
+        }
+
+        const api = new BaiduPanAPI(account.cookies, account.proxy);
+        const userInfo = await api.getUserInfo();
+
+        if (!userInfo) {
+            return res.json({ success: false, message: 'Cookies已失效' });
+        }
+
+        const bdstoken = await api.getBdstoken();
+        if (bdstoken && bdstoken !== account.bdstoken) {
+            db.updateAccount(req.params.id, { bdstoken });
+        }
+
+        // 实测数据接口
+        const session = await api.validateSession();
+        if (!session.valid) {
+            return res.json({
+                success: false,
+                message: `Cookies已失效或不完整（${session.message || '身份验证失败'}），请重新添加账号并粘贴最新的完整Cookie`
+            });
+        }
+
+        res.json({ 
+            success: true, 
+            data: { 
+                userInfo, 
+                bdstoken,
+                valid: true 
+            } 
+        });
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
+});
+
+// 获取API实例
+function getApi(accountId) {
+    if (apiInstances.has(accountId)) {
+        return apiInstances.get(accountId);
+    }
+    const account = db.getAccount(accountId);
+    if (!account) {
+        throw new Error('账号不存在');
+    }
+    const api = new BaiduPanAPI(account.cookies, account.proxy);
+    api.bdstoken = account.bdstoken;
+    apiInstances.set(accountId, api);
+    return api;
+}
+
+// ========== 文件操作 ==========
+
+// 获取文件列表
+app.get('/api/files', async (req, res) => {
+    try {
+        const { accountId, dir = '/', page = 1, num = 100, order = 'time', desc = 1 } = req.query;
+        const api = getApi(accountId);
+        const result = await api.getFileList(dir, page, num, order, desc);
+        res.json({ success: true, data: result });
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
+});
+
+// 删除文件
+app.post('/api/files/delete', async (req, res) => {
+    try {
+        const { accountId, filelist, path } = req.body;
+        const api = getApi(accountId);
+        const result = await api.deleteFiles(filelist, path);
+        res.json({ success: true, data: result });
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
+});
+
+// 移动文件
+app.post('/api/files/move', async (req, res) => {
+    try {
+        const { accountId, filelist, destPath } = req.body;
+        const api = getApi(accountId);
+        const result = await api.moveFiles(filelist, destPath);
+        res.json({ success: true, data: result });
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
+});
+
+// 创建文件夹
+app.post('/api/files/mkdir', async (req, res) => {
+    try {
+        const { accountId, path, name } = req.body;
+        const api = getApi(accountId);
+        const result = await api.createFolder(path, name);
+        res.json({ success: true, data: result });
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
+});
+
+// ========== 和谐文件检测 ==========
+
+// 开始检测任务
+app.post('/api/check/start', async (req, res) => {
+    try {
+        const { accountId, dir = '/', includeKeywords = '', excludeKeywords = '', concurrency = 3, delay = 1000, autoDelete = false, movePath = '' } = req.body;
+        const account = db.getAccount(accountId);
+        if (!account) {
+            return res.json({ success: false, message: '账号不存在' });
+        }
+
+        const taskId = Date.now().toString();
+        
+        // 创建任务记录
+        db.addTask({
+            taskId,
+            accountId,
+            dir,
+            includeKeywords,
+            excludeKeywords,
+            status: 'running'
+        });
+
+        const checker = new ViolationChecker(account, {
+            dir,
+            includeKeywords: includeKeywords ? includeKeywords.split(/[,，]/).filter(Boolean) : [],
+            excludeKeywords: excludeKeywords ? excludeKeywords.split(/[,，]/).filter(Boolean) : [],
+            concurrency: parseInt(concurrency) || 3,
+            delay: parseInt(delay) || 1000,
+            autoDelete: !!autoDelete,
+            movePath: movePath || ''
+        });
+
+        checkTasks.set(taskId, checker);
+
+        // 开始检测
+        checker.start().then(() => {
+            // 检测完成，保存记录
+            const results = checker.getResults();
+            const progress = checker.getProgress();
+            
+            results.forEach(item => {
+                db.addViolationRecord({
+                    accountId,
+                    taskId,
+                    filename: item.filename,
+                    path: item.path,
+                    fs_id: item.fs_id,
+                    size: item.size,
+                    reason: item.reason,
+                    status: item.status,
+                    is_dir: item.is_dir
+                });
+            });
+
+            // 更新任务状态
+            db.updateTask(taskId, {
+                status: 'completed',
+                total_files: progress.total,
+                checked_files: progress.checked,
+                violation_count: progress.violation
+            });
+        }).catch(err => {
+            console.error('检测任务出错:', err);
+            db.updateTask(taskId, { status: 'error' });
+        });
+
+        res.json({ success: true, data: { taskId } });
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
+});
+
+// 获取检测进度
+app.get('/api/check/progress/:taskId', (req, res) => {
+    try {
+        const checker = checkTasks.get(req.params.taskId);
+        if (!checker) {
+            return res.json({ success: false, message: '任务不存在' });
+        }
+        const progress = checker.getProgress();
+        const results = checker.getResults();
+        res.json({ success: true, data: { progress, results } });
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
+});
+
+// 暂停检测任务
+app.post('/api/check/pause/:taskId', (req, res) => {
+    try {
+        const checker = checkTasks.get(req.params.taskId);
+        if (!checker) {
+            return res.json({ success: false, message: '任务不存在' });
+        }
+        checker.pause();
+        res.json({ success: true });
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
+});
+
+// 恢复检测任务
+app.post('/api/check/resume/:taskId', (req, res) => {
+    try {
+        const checker = checkTasks.get(req.params.taskId);
+        if (!checker) {
+            return res.json({ success: false, message: '任务不存在' });
+        }
+        checker.resume();
+        res.json({ success: true });
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
+});
+
+// 停止检测任务
+app.post('/api/check/stop/:taskId', (req, res) => {
+    try {
+        const taskId = req.params.taskId;
+        const checker = checkTasks.get(taskId);
+        if (!checker) {
+            return res.json({ success: false, message: '任务不存在' });
+        }
+        checker.stop();
+        
+        // 保存已有结果
+        const results = checker.getResults();
+        const progress = checker.getProgress();
+        const accountId = checker.account.id;
+        
+        results.forEach(item => {
+            db.addViolationRecord({
+                accountId,
+                taskId,
+                filename: item.filename,
+                path: item.path,
+                fs_id: item.fs_id,
+                size: item.size,
+                reason: item.reason,
+                status: item.status,
+                is_dir: item.is_dir
+            });
+        });
+        
+        db.updateTask(taskId, {
+            status: 'stopped',
+            total_files: progress.total,
+            checked_files: progress.checked,
+            violation_count: progress.violation
+        });
+        
+        res.json({ success: true });
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
+});
+
+// ========== 和谐文件记录 ==========
+
+// 获取和谐文件记录
+app.get('/api/violations', (req, res) => {
+    try {
+        const { accountId, taskId, page = 1, pageSize = 50 } = req.query;
+        const result = db.getViolationRecords({ accountId, taskId, page: parseInt(page), pageSize: parseInt(pageSize) });
+        res.json({ success: true, data: result });
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
+});
+
+// 删除和谐文件记录
+app.delete('/api/violations/:id', (req, res) => {
+    try {
+        db.deleteViolationRecord(req.params.id);
+        res.json({ success: true });
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
+});
+
+// 批量删除和谐文件记录
+app.post('/api/violations/clear', (req, res) => {
+    try {
+        const { accountId, taskId, onlySuccess } = req.body;
+        db.clearViolationRecords({ accountId, taskId, onlySuccess });
+        res.json({ success: true });
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
+});
+
+// 一键删除违规文件（从百度网盘删除，移入网盘回收站）
+app.post('/api/violations/delete-files', async (req, res) => {
+    try {
+        const { accountId, ids } = req.body;
+        if (!accountId) {
+            return res.json({ success: false, message: '请指定账号' });
+        }
+        const api = getApi(accountId);
+
+        // 待删除记录：指定 ids，否则该账号下全部未删除的违规记录
+        let records = db.getAllViolationRecords({ accountId });
+        if (Array.isArray(ids) && ids.length > 0) {
+            const idSet = new Set(ids.map(String));
+            records = records.filter(r => idSet.has(String(r.id)));
+        }
+        records = records.filter(r => r.status !== 'deleted');
+
+        if (records.length === 0) {
+            return res.json({ success: true, data: { deleted: 0, failed: 0, message: '没有待删除的文件' } });
+        }
+
+        let deleted = 0, failed = 0;
+        const CHUNK = 50; // 网盘删除接口单批数量
+        for (let i = 0; i < records.length; i += CHUNK) {
+            const chunk = records.slice(i, i + CHUNK);
+            const result = await api.deleteFiles(chunk.map(r => ({ path: r.path })));
+            if (result.success) {
+                for (const r of chunk) db.updateViolationRecord(r.id, { status: 'deleted' });
+                deleted += chunk.length;
+            } else {
+                // 批量失败 → 逐个重试，定位失败项
+                for (const r of chunk) {
+                    const single = await api.deleteFiles([{ path: r.path }]);
+                    if (single.success) {
+                        db.updateViolationRecord(r.id, { status: 'deleted' });
+                        deleted++;
+                    } else {
+                        db.updateViolationRecord(r.id, { status: 'delete_failed' });
+                        failed++;
+                    }
+                    await new Promise(s => setTimeout(s, 300));
+                }
+            }
+            if (i + CHUNK < records.length) {
+                await new Promise(s => setTimeout(s, 500));
+            }
+        }
+
+        res.json({ success: true, data: { deleted, failed } });
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
+});
+
+// 导出和谐文件记录
+app.get('/api/violations/export', (req, res) => {
+    try {
+        const { accountId, taskId, format = 'csv' } = req.query;
+        const records = db.getAllViolationRecords({ accountId, taskId });
+        
+        if (format === 'csv') {
+            const header = '文件名,路径,大小,原因,状态,检测时间\n';
+            const rows = records.map(r => 
+                `"${r.filename}","${r.path}",${r.size},"${r.reason}","${r.status}","${r.created_at}"`
+            ).join('\n');
+            const csv = '\ufeff' + header + rows;
+            res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+            res.setHeader('Content-Disposition', 'attachment; filename=violations.csv');
+            res.send(csv);
+        } else {
+            res.json({ success: true, data: records });
+        }
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
+});
+
+// ========== 重复文件扫描 ==========
+
+// 开始扫描
+app.post('/api/dupes/scan', (req, res) => {
+    try {
+        const { accountId, dir = '/' } = req.body;
+        const account = db.getAccount(accountId);
+        if (!account) {
+            return res.json({ success: false, message: '账号不存在' });
+        }
+
+        const taskId = Date.now().toString();
+        const scanner = new DuplicateScanner(account, { dir });
+        dupeTasks.set(taskId, scanner);
+
+        scanner.start()
+            .then(() => {
+                // 扫完一次性落盘（被停止的不保存）
+                if (!scanner.isStopped) {
+                    const r = scanner.getResults();
+                    scanner.savedScanId = db.addDupeScan({
+                        taskId, accountId: account.id, dir,
+                        totalFiles: scanner.totalFiles,
+                        stats: r.stats, groups: r.groups
+                    });
+                }
+            })
+            .catch(e => console.error('重复文件扫描任务出错:', e))
+            .finally(() => {
+                setTimeout(() => dupeTasks.delete(taskId), 3600000);
+            });
+
+        res.json({ success: true, data: { taskId } });
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
+});
+
+// 扫描进度
+app.get('/api/dupes/progress/:taskId', (req, res) => {
+    try {
+        const scanner = dupeTasks.get(req.params.taskId);
+        if (!scanner) {
+            return res.json({ success: false, message: '任务不存在或已过期' });
+        }
+        const p = scanner.getProgress();
+        res.json({ success: true, data: { ...p, savedScanId: scanner.savedScanId || null } });
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
+});
+
+// 停止扫描
+app.post('/api/dupes/stop/:taskId', (req, res) => {
+    try {
+        const scanner = dupeTasks.get(req.params.taskId);
+        if (scanner) scanner.stop();
+        res.json({ success: true });
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
+});
+
+// 历史扫描列表（不含分组明细）
+app.get('/api/dupes/scans', (req, res) => {
+    try {
+        const { accountId } = req.query;
+        res.json({ success: true, data: db.getDupeScans(accountId) });
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
+});
+
+// 单次扫描完整结果（含分组）
+app.get('/api/dupes/scans/:id', (req, res) => {
+    try {
+        const scan = db.getDupeScan(req.params.id);
+        if (!scan) {
+            return res.json({ success: false, message: '扫描记录不存在' });
+        }
+        res.json({ success: true, data: scan });
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
+});
+
+// 删除扫描记录
+app.delete('/api/dupes/scans/:id', (req, res) => {
+    try {
+        db.deleteDupeScan(req.params.id);
+        res.json({ success: true });
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
+});
+
+// 删除选中的重复文件（移入网盘回收站），并更新快照中的已删标记
+app.post('/api/dupes/delete', async (req, res) => {
+    try {
+        const { accountId, scanId, paths } = req.body;
+        if (!accountId) {
+            return res.json({ success: false, message: '请指定账号' });
+        }
+        if (!Array.isArray(paths) || paths.length === 0) {
+            return res.json({ success: false, message: '没有待删除的文件' });
+        }
+
+        const api = getApi(accountId);
+        const CHUNK = 50;
+        const succeeded = [];
+        let failed = 0;
+
+        for (let i = 0; i < paths.length; i += CHUNK) {
+            const chunk = paths.slice(i, i + CHUNK);
+            const result = await api.deleteFiles(chunk.map(p => ({ path: p })));
+            if (result.success) {
+                succeeded.push(...chunk);
+            } else {
+                // 批量失败 → 逐个重试，定位失败项
+                for (const p of chunk) {
+                    const single = await api.deleteFiles([{ path: p }]);
+                    if (single.success) succeeded.push(p);
+                    else failed++;
+                    await new Promise(s => setTimeout(s, 300));
+                }
+            }
+            if (i + CHUNK < paths.length) {
+                await new Promise(s => setTimeout(s, 500));
+            }
+        }
+
+        if (scanId && succeeded.length > 0) {
+            db.markDupeFilesDeleted(scanId, succeeded);
+        }
+
+        res.json({ success: true, data: { requested: paths.length, deleted: succeeded.length, failed } });
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
+});
+
+// ========== 检测任务历史 ==========
+
+app.get('/api/tasks', (req, res) => {
+    try {
+        const { accountId } = req.query;
+        const tasks = db.getTasks(accountId);
+        res.json({ success: true, data: tasks });
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
+});
+
+// ========== 系统设置 ==========
+
+app.get('/api/settings', (req, res) => {
+    try {
+        const settings = db.getSettings();
+        res.json({ success: true, data: settings });
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
+});
+
+app.post('/api/settings', (req, res) => {
+    try {
+        const { key, value } = req.body;
+        db.setSetting(key, value);
+        res.json({ success: true });
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
+});
+
+// 启动服务器
+app.listen(PORT, () => {
+    console.log(`========================================`);
+    console.log(`  百度网盘和谐文件清理工具 - 免费开源版`);
+    console.log(`  服务器已启动: http://localhost:${PORT}`);
+    console.log(`  数据目录: ${dataDir}`);
+    console.log(`========================================`);
+    
+    // 自动打开浏览器
+    const { exec } = require('child_process');
+    exec(`start http://localhost:${PORT}`, (err) => {
+        if (err) console.log('请手动打开浏览器访问: http://localhost:' + PORT);
+    });
+});

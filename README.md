@@ -11,6 +11,8 @@ Free & open-source Baidu Netdisk cleaner: detect harmonized (blocked) files, fin
 - **账号管理**：浏览器自动登录（推荐）或手动粘贴 Cookie，支持多账号、代理
 - **文件浏览**：网页端浏览网盘目录，直接删除/移动文件
 - **违规记录**：检测结果持久化，支持导出 CSV、一键删除违规文件
+- **搜索与分页**：违规记录、重复文件分组、历史扫描、文件浏览均支持关键词搜索与翻页
+- **删除进度**：大批量删除实时进度反馈，任务式异步执行
 - **抗限流**：自动识别限流信号（含 errno 8001），指数退避等待恢复，不死磕不误判
 
 ## 快速开始
@@ -33,10 +35,20 @@ Windows 用户也可以双击 `start.bat`（自动检测环境、启动并打开
 
 ### 打包成 exe（可选）
 
+**方式一：pkg 单文件（轻量，命令行）**
+
 ```bash
 npm install -g pkg
 npm run build
 # 产物在 dist/baidu-pan-cleaner.exe
+```
+
+**方式二：Electron 桌面应用（推荐，有图形界面）**
+
+```bash
+npm install --save-dev electron electron-builder
+npm run dist
+# 产物在 dist/NetdiskCleaner-portable.exe（便携版，数据目录跟随 exe）
 ```
 
 ## 使用文档

@@ -324,6 +324,68 @@ app.post('/api/files/mkdir', async (req, res) => {
 
 // ========== 和谐文件检测 ==========
 
+// 探测检测接口（/api/download）当前是否可用：登录态 → 取真实文件 → 单次直链请求
+app.post('/api/check/probe', async (req, res) => {
+    try {
+        const { accountId, dir = '/' } = req.body;
+        const account = db.getAccount(accountId);
+        if (!account) {
+            return res.json({ success: false, message: '账号不存在' });
+        }
+        const api = getApi(accountId);
+
+        // 1) 登录态
+        const user = await api.getUserInfo();
+        if (!user) {
+            return res.json({ success: true, data: { ok: false, message: '登录状态异常，请重新验证账号 Cookies' } });
+        }
+
+        // 2) 取探测文件（检测目录下最多 10 个真实文件）
+        let probeIds = [];
+        try {
+            const r = await api.getFileList(dir, 1, 10);
+            probeIds = (r.list || []).filter(f => f.isdir !== 1).slice(0, 10).map(f => f.fs_id);
+        } catch (e) {
+            return res.json({ success: true, data: { ok: false, message: `获取文件列表失败: ${e.message}` } });
+        }
+        if (probeIds.length === 0) {
+            return res.json({ success: true, data: { ok: false, message: '该目录下没有文件可用于探测，请换一个目录' } });
+        }
+
+        // 3) 单次调用 download 直链接口
+        let r2;
+        try {
+            r2 = await api.downloadDlink(probeIds);
+        } catch (e) {
+            return res.json({ success: true, data: { ok: false, message: `直链接口请求异常: ${e.message}` } });
+        }
+
+        const e2 = r2.errno;
+        if (e2 === 0) {
+            const n = (r2.raw && Array.isArray(r2.raw.dlink)) ? r2.raw.dlink.length : 0;
+            return res.json({
+                success: true,
+                data: n > 0
+                    ? { ok: true, message: `检测接口正常（${n}/${probeIds.length} 个文件成功获取直链）` }
+                    : { ok: true, message: '接口可访问，但本批文件均未返回直链（可能全部违规）' }
+            });
+        }
+        if (e2 === 113) {
+            await api.refreshSign().catch(() => {});
+            return res.json({ success: true, data: { ok: false, message: '签名已过期，已自动刷新，请再点一次测试' } });
+        }
+        if ([-7, -8, 112, 429, 414, 31034, 8001].includes(e2)) {
+            return res.json({ success: true, data: { ok: false, message: `检测接口被限流 (errno=${e2})，需等待恢复` } });
+        }
+        if (e2 === -1) {
+            return res.json({ success: true, data: { ok: true, message: '接口可访问，但本批含无法获取直链的文件（可能含违规文件）' } });
+        }
+        return res.json({ success: true, data: { ok: false, message: `接口返回 errno=${e2}（${(r2.raw && r2.raw.errmsg) || '未知错误'}）` } });
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
+});
+
 // 开始检测任务
 app.post('/api/check/start', async (req, res) => {
     try {

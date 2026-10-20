@@ -344,6 +344,30 @@ document.querySelectorAll('input[name="check-action"]').forEach(radio => {
     });
 });
 
+// 测试检测接口是否可用（单次请求，用于试探限流是否恢复）
+document.getElementById('btn-probe-check').addEventListener('click', async () => {
+    const accountId = document.getElementById('check-account').value;
+    if (!accountId) {
+        showToast('请先选择账号', 'error');
+        return;
+    }
+    const dir = document.getElementById('check-dir').value.trim() || '/';
+    const btn = document.getElementById('btn-probe-check');
+    btn.disabled = true;
+    try {
+        const res = await API.post('/api/check/probe', { accountId, dir });
+        if (res.success && res.data) {
+            showToast(res.data.message, res.data.ok ? 'success' : 'error');
+        } else {
+            showToast(res.message || '探测失败', 'error');
+        }
+    } catch (e) {
+        showToast('探测失败: ' + e.message, 'error');
+    } finally {
+        btn.disabled = false;
+    }
+});
+
 document.getElementById('btn-start-check').addEventListener('click', startCheck);
 document.getElementById('btn-pause-check').addEventListener('click', togglePause);
 document.getElementById('btn-stop-check').addEventListener('click', stopCheck);

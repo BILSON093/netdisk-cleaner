@@ -7,6 +7,19 @@ const puppeteer = require('puppeteer-core');
 const fs = require('fs');
 const path = require('path');
 
+// 登录用的独立浏览器数据目录
+// 注意：打包后 __dirname 位于 asar/pkg 快照内（虚拟路径，外部进程不可写），
+// 必须解析到真实可写目录，否则浏览器进程启动即失败
+function getLoginProfileDir() {
+    if (process.env.CLEANER_DATA_DIR) {
+        return path.join(process.env.CLEANER_DATA_DIR, 'data', 'login-profile');
+    }
+    if (process.pkg) {
+        return path.join(path.dirname(process.execPath), 'data', 'login-profile');
+    }
+    return path.join(__dirname, '..', 'data', 'login-profile');
+}
+
 // 查找本机可用的浏览器
 function findBrowser() {
     const candidates = [
@@ -63,7 +76,7 @@ class BrowserLoginSession {
                     '--start-maximized',
                     '--disable-blink-features=AutomationControlled',
                     // 使用独立用户数据目录，不影响日常浏览器
-                    `--user-data-dir=${path.join(__dirname, '..', 'data', 'login-profile')}`
+                    `--user-data-dir=${getLoginProfileDir()}`
                 ]
             });
 

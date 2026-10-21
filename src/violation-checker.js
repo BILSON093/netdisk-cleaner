@@ -9,7 +9,7 @@ class ViolationChecker {
         this.dir = options.dir || '/';
         this.includeKeywords = options.includeKeywords || [];
         this.excludeKeywords = options.excludeKeywords || [];
-        this.delay = options.delay || 1500;
+        this.delay = options.delay || 2000;
         this.batchSize = options.batchSize || 10;
         this.autoDelete = options.autoDelete || false;
         this.movePath = options.movePath || '';
@@ -27,6 +27,12 @@ class ViolationChecker {
         this.allFiles = [];
         this._refCursor = 0;      // 参照文件轮询游标（从已判定正常的文件里取，避免重复请求同一 fid）
         this.rateLimitHits = 0;
+
+        // 限流优化标记：首次触发限流后进入保守模式，delay ×1.5
+        // 批次结束后重置（避免永远保持慢节奏）
+        this._rateLimitedDetected = false;
+        // 待移动/删除的违规文件队列（检测完统一批量执行，避免与检测请求交叉叠加触发风控）
+        this._pendingActions = [];
     }
 
     // 关键词过滤
@@ -121,15 +127,22 @@ class ViolationChecker {
 
     // 触发限流后指数退避（可被 stop 打断）
     async rateLimitBackoff() {
+        // 首次限流触发全局保守模式：后续所有检测间隔 ×1.5
+        this._rateLimitedDetected = true;
         this.rateLimitHits++;
         const wait = Math.min(60000, 5000 * this.rateLimitHits);
-        console.log(`触发频率限制，暂停 ${Math.round(wait / 1000)}s 后重试`);
+        console.log(`触发频率限制，暂停 ${Math.round(wait / 1000)}s 后重试（保守模式已开启）`);
         this.isPaused = true;
         for (let t = 0; t < wait; t += 1000) {
             if (this.isStopped) break;
             await this.sleep(1000);
         }
         this.isPaused = false;
+    }
+
+    // 动态检测间隔：基础值 × 保守模式系数（限流后 1.5，正常 1.0）
+    getDelay() {
+        return this.delay * (this._rateLimitedDetected ? 1.5 : 1);
     }
 
     // 请求一组 fid（含重试、限流、sign 失效处理）。返回 {errno}
@@ -140,7 +153,7 @@ class ViolationChecker {
         for (let attempt = 0; attempt < 10; attempt++) {
             if (this.isStopped) return { errno: 'stopped' };
             await this.waitIfPaused();
-            await this.sleep(this.delay);
+            await this.sleep(this.getDelay());
 
             let r;
             try {
@@ -188,7 +201,7 @@ class ViolationChecker {
                 await this.rateLimitBackoff();
                 continue;
             }
-            await this.sleep(this.delay);
+            await this.sleep(this.getDelay());
 
             let r;
             try { r = await this.api.downloadDlink([file.fs_id]); } catch (e) { r = { errno: 'err' }; }
@@ -237,6 +250,8 @@ class ViolationChecker {
         this.checkedFiles++;
     }
 
+    // ====== download 引擎：二分定位 + 复核（可识别软和谐） ======
+
     // 递归分类一组文件：0=全正常；否则对半拆分定位到单文件
     async classifyGroup(files) {
         if (this.isStopped || files.length === 0) return;
@@ -277,18 +292,65 @@ class ViolationChecker {
     }
 
     // 处理违规文件（自动删除或移动）
+    // 改动：不再同步调 API，只收集到 _pendingActions 队列
+    // 原因：move/delete 与 downloadDlink 共享账号级限流窗口，边检测边移/删会叠加请求密度
+    // 正确做法：检测请求全部完成后，再统一批量执行 move/delete（50个/批，风控极低）
     async handleViolationFile(file) {
-        if (this.autoDelete) {
-            const deleteResult = await this.api.deleteFiles([file]);
-            return deleteResult.success ? 'deleted' : 'delete_failed';
+        if (this.autoDelete || this.movePath) {
+            this._pendingActions.push({ path: file.path });
+            return this.autoDelete ? 'pending_delete' : (this.movePath ? 'pending_move' : 'violation');
         }
-
-        if (this.movePath) {
-            const moveResult = await this.api.moveFiles([file], this.movePath);
-            return moveResult.success ? 'moved' : 'move_failed';
-        }
-
         return 'violation';
+    }
+
+    // 确保移动目标文件夹存在（createFolder 幂等，已存在时会失败但不影响 move 接口）
+    async ensureMoveFolder() {
+        if (!this.movePath) return;
+        const parent = this.movePath.slice(0, this.movePath.lastIndexOf('/')) || '/';
+        const name = this.movePath.slice(this.movePath.lastIndexOf('/') + 1);
+        if (!name) return;
+        try {
+            await this.api.createFolder(parent, name);
+        } catch (e) {
+            // 文件夹可能已存在，忽略错误
+            console.log('确保移动文件夹:', e.message);
+        }
+    }
+
+    // 检测完成后统一批量执行移动/删除（与检测请求完全解耦，避免风控叠加）
+    // move 走 filemanager?opera=move 接口，50个/批，风控极低
+    async flushPendingActions() {
+        if (this._pendingActions.length === 0) return;
+        const items = this._pendingActions;
+        this._pendingActions = [];
+        const CHUNK = 50;
+        console.log(`检测完成，统一批量处理 ${items.length} 个违规文件（${this.movePath ? '移动' : (this.autoDelete ? '删除' : '仅记录')}）`);
+        try {
+            if (this.movePath) {
+                for (let i = 0; i < items.length; i += CHUNK) {
+                    if (this.isStopped) break;
+                    const chunk = items.slice(i, i + CHUNK);
+                    const result = await this.api.moveFiles(chunk, this.movePath);
+                    if (!result.success) {
+                        // 批量失败时逐个重试
+                        for (const it of chunk) {
+                            if (this.isStopped) break;
+                            await this.api.moveFiles([it], this.movePath);
+                        }
+                    }
+                    if (i + CHUNK < items.length) await this.sleep(500);
+                }
+            } else if (this.autoDelete) {
+                for (let i = 0; i < items.length; i += CHUNK) {
+                    if (this.isStopped) break;
+                    const chunk = items.slice(i, i + CHUNK);
+                    await this.api.deleteFiles(chunk);
+                    if (i + CHUNK < items.length) await this.sleep(500);
+                }
+            }
+        } catch (e) {
+            console.error('批量处理违规文件失败:', e.message);
+        }
     }
 
     // 开始检测
@@ -300,11 +362,16 @@ class ViolationChecker {
         this.isPaused = false;
         this.rateLimitHits = 0;
         this._refCursor = 0;
+        this._rateLimitedDetected = false;   // 每次新检测批次重置保守模式
+        this._pendingActions = [];
 
         try {
             // 准备令牌与下载签名
             await this.api.ensureToken();
             try { await this.api.refreshSign(); } catch (e) { console.error('获取下载签名失败:', e.message); }
+
+            // 检测前先确保移动目标文件夹存在（幂等），避免中途创建增加请求密度
+            if (this.movePath) await this.ensureMoveFolder();
 
             // 第一步：收集所有文件
             console.log(`开始收集文件，目录: ${this.dir}`);
@@ -317,6 +384,7 @@ class ViolationChecker {
             }
 
             // 第二步：按目录分批检测
+            const batch = this.batchSize;
             const byDir = new Map();
             for (const f of this.allFiles) {
                 const d = f.path.slice(0, f.path.lastIndexOf('/')) || '/';
@@ -326,15 +394,18 @@ class ViolationChecker {
 
             for (const files of byDir.values()) {
                 if (this.isStopped) break;
-                for (let i = 0; i < files.length; i += this.batchSize) {
+                for (let i = 0; i < files.length; i += batch) {
                     if (this.isStopped) break;
-                    await this.classifyGroup(files.slice(i, i + this.batchSize));
+                    await this.classifyGroup(files.slice(i, i + batch));
                 }
             }
 
         } catch (e) {
             console.error('检测任务出错:', e);
         } finally {
+            // 关键：检测请求窗口完全结束后，再统一批量执行 move/delete
+            // 避免 move/delete 的 filemanager 请求与 downloadDlink 请求重叠，降低风控概率
+            await this.flushPendingActions();
             this.isRunning = false;
             console.log(`检测完成: 总计 ${this.totalFiles}, 已检测 ${this.checkedFiles}, 违规 ${this.violationFiles.length}, 正常 ${this.normalFiles.length}, 失败 ${this.failedFiles.length}`);
         }
@@ -349,8 +420,12 @@ class ViolationChecker {
     }
 
     stop() {
-        this.isStopped = true;
-        this.isPaused = false;
+        // 先把已收集的待处理文件 flush 掉，再标记停止
+        // 这样即使中途停止，已检测出的违规文件也能被正常处理
+        this.flushPendingActions().catch(() => {}).finally(() => {
+            this.isStopped = true;
+            this.isPaused = false;
+        });
     }
 
     getProgress() {

@@ -12,10 +12,6 @@ const PORT = process.env.PORT || 37471;
 
 // 获取应用程序基础目录（打包后为exe所在目录）
 function getAppDir() {
-    // 显式指定数据目录（如 Electron 便携模式）
-    if (process.env.CLEANER_DATA_DIR) {
-        return process.env.CLEANER_DATA_DIR;
-    }
     // pkg 环境下使用 exe 所在目录
     if (process.pkg) {
         return path.dirname(process.execPath);
@@ -44,6 +40,50 @@ const dupeTasks = new Map();
 // 存储删除任务（违规文件删除 / 重复文件删除共用）
 // taskId → { total, processed, deleted, failed, current, done }
 const deleteTasks = new Map();
+
+// 通用移动执行器：分批移动 + 失败逐个重试，实时更新进度
+// CHUNK 内的批量 move 风控极低（filemanager 日常操作），失败才逐个
+async function runMoveTask(taskId, api, items, targetPath, onSuccess, onFail) {
+    const task = deleteTasks.get(taskId);
+    const CHUNK = 50;
+    try {
+        // 先确保目标文件夹存在（createFolder 幂等）
+        await api.createFolder(path.dirname(targetPath) || '/', path.basename(targetPath));
+
+        for (let i = 0; i < items.length; i += CHUNK) {
+            const chunk = items.slice(i, i + CHUNK);
+            const result = await api.moveFiles(chunk.map(it => ({ path: it.path })), targetPath);
+            if (result.success) {
+                onSuccess(chunk);
+                task.moved += chunk.length;
+            } else {
+                for (const it of chunk) {
+                    const single = await api.moveFiles([{ path: it.path }], targetPath);
+                    if (single.success) {
+                        onSuccess([it]);
+                        task.moved++;
+                    } else {
+                        onFail(it);
+                        task.failed++;
+                    }
+                    task.current = it.path;
+                    task.processed = task.moved + task.failed;
+                    await new Promise(s => setTimeout(s, 300));
+                }
+            }
+            task.processed = task.moved + task.failed;
+            if (i + CHUNK < items.length) {
+                await new Promise(s => setTimeout(s, 500));
+            }
+        }
+    } catch (e) {
+        task.error = e.message;
+    } finally {
+        task.done = true;
+        task.current = '';
+        setTimeout(() => deleteTasks.delete(taskId), 600000);
+    }
+}
 
 // 通用删除执行器：分批删除 + 失败逐个重试，实时更新进度
 async function runDeleteTask(taskId, api, items, onSuccess, onFail) {
@@ -396,7 +436,7 @@ app.post('/api/check/start', async (req, res) => {
         }
 
         const taskId = Date.now().toString();
-        
+
         // 创建任务记录
         db.addTask({
             taskId,
@@ -546,8 +586,9 @@ app.post('/api/check/stop/:taskId', (req, res) => {
 // 获取和谐文件记录
 app.get('/api/violations', (req, res) => {
     try {
-        const { accountId, taskId, keyword, page = 1, pageSize = 50 } = req.query;
-        const result = db.getViolationRecords({ accountId, taskId, keyword, page: parseInt(page), pageSize: parseInt(pageSize) });
+        const { accountId, taskId, keyword, status, page = 1, pageSize = 50 } = req.query;
+        const statusList = status ? (Array.isArray(status) ? status : [status]) : undefined;
+        const result = db.getViolationRecords({ accountId, taskId, keyword, status: statusList, page: parseInt(page), pageSize: parseInt(pageSize) });
         res.json({ success: true, data: result });
     } catch (e) {
         res.json({ success: false, message: e.message });
@@ -567,8 +608,8 @@ app.delete('/api/violations/:id', (req, res) => {
 // 批量删除和谐文件记录
 app.post('/api/violations/clear', (req, res) => {
     try {
-        const { accountId, taskId, onlySuccess } = req.body;
-        db.clearViolationRecords({ accountId, taskId, onlySuccess });
+        const { accountId, taskId, onlySuccess, onlyDeleted } = req.body;
+        db.clearViolationRecords({ accountId, taskId, onlySuccess: !!onlySuccess, onlyDeleted: !!onlyDeleted });
         res.json({ success: true });
     } catch (e) {
         res.json({ success: false, message: e.message });
@@ -597,7 +638,7 @@ app.post('/api/violations/delete-files', async (req, res) => {
         }
 
         const taskId = 'del_' + Date.now();
-        deleteTasks.set(taskId, { total: records.length, processed: 0, deleted: 0, failed: 0, current: '', done: false });
+        deleteTasks.set(taskId, { total: records.length, processed: 0, deleted: 0, moved: 0, failed: 0, current: '', done: false });
 
         runDeleteTask(
             taskId,
@@ -605,6 +646,48 @@ app.post('/api/violations/delete-files', async (req, res) => {
             records.map(r => ({ id: r.id, path: r.path })),
             (chunk) => chunk.forEach(it => db.updateViolationRecord(it.id, { status: 'deleted' })),
             (it) => db.updateViolationRecord(it.id, { status: 'delete_failed' })
+        );
+
+        res.json({ success: true, data: { taskId, total: records.length } });
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
+});
+
+// 批量移动违规文件到指定文件夹（非检测过程中触发，直接调用 filemanager move 接口，风控极低）
+app.post('/api/violations/move-files', async (req, res) => {
+    try {
+        const { accountId, ids, targetPath } = req.body;
+        if (!accountId) {
+            return res.json({ success: false, message: '请指定账号' });
+        }
+        if (!targetPath) {
+            return res.json({ success: false, message: '请指定目标文件夹' });
+        }
+        const api = getApi(accountId);
+
+        let records = db.getAllViolationRecords({ accountId });
+        if (Array.isArray(ids) && ids.length > 0) {
+            const idSet = new Set(ids.map(String));
+            records = records.filter(r => idSet.has(String(r.id)));
+        }
+        // 排除已被移动/删除的记录
+        records = records.filter(r => r.status !== 'moved' && r.status !== 'deleted');
+
+        if (records.length === 0) {
+            return res.json({ success: true, data: { taskId: null, moved: 0, failed: 0, message: '没有待移动的文件' } });
+        }
+
+        const taskId = 'move_' + Date.now();
+        deleteTasks.set(taskId, { total: records.length, processed: 0, deleted: 0, moved: 0, failed: 0, current: '', done: false });
+
+        runMoveTask(
+            taskId,
+            api,
+            records.map(r => ({ id: r.id, path: r.path })),
+            targetPath,
+            (chunk) => chunk.forEach(it => db.updateViolationRecord(it.id, { status: 'moved' })),
+            (it) => db.updateViolationRecord(it.id, { status: 'move_failed' })
         );
 
         res.json({ success: true, data: { taskId, total: records.length } });
@@ -747,7 +830,7 @@ app.post('/api/dupes/delete', async (req, res) => {
         const succeeded = [];
 
         const taskId = 'del_' + Date.now();
-        deleteTasks.set(taskId, { total: paths.length, processed: 0, deleted: 0, failed: 0, current: '', done: false });
+        deleteTasks.set(taskId, { total: paths.length, processed: 0, deleted: 0, moved: 0, failed: 0, current: '', done: false });
 
         runDeleteTask(
             taskId,
@@ -800,30 +883,17 @@ app.post('/api/settings', (req, res) => {
     }
 });
 
-// 启动服务器；port 传 0 时由系统分配随机端口（Electron 模式避免端口冲突）
-function startServer(port = PORT) {
-    return new Promise((resolve) => {
-        const server = app.listen(port, () => {
-            const actualPort = server.address().port;
-            console.log(`========================================`);
-            console.log(`  Netdisk Cleaner - 免费开源版`);
-            console.log(`  服务器已启动: http://localhost:${actualPort}`);
-            console.log(`  数据目录: ${dataDir}`);
-            console.log(`========================================`);
-            resolve({ server, port: actualPort });
-        });
+// 启动服务器
+app.listen(PORT, () => {
+    console.log(`========================================`);
+    console.log(`  百度网盘和谐文件清理工具 - 免费开源版`);
+    console.log(`  服务器已启动: http://localhost:${PORT}`);
+    console.log(`  数据目录: ${dataDir}`);
+    console.log(`========================================`);
+    
+    // 自动打开浏览器
+    const { exec } = require('child_process');
+    exec(`start http://localhost:${PORT}`, (err) => {
+        if (err) console.log('请手动打开浏览器访问: http://localhost:' + PORT);
     });
-}
-
-// 直接运行（node src/main.js）时启动并自动打开浏览器；
-// 被 Electron require 时由 electron/main.js 调用 startServer 并加载窗口
-if (require.main === module) {
-    startServer().then(({ port }) => {
-        const { exec } = require('child_process');
-        exec(`start http://localhost:${port}`, (err) => {
-            if (err) console.log('请手动打开浏览器访问: http://localhost:' + port);
-        });
-    });
-}
-
-module.exports = { app, startServer };
+});

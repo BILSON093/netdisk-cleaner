@@ -1,8 +1,8 @@
 const fs = require('fs');
 const path = require('path');
 
-// 违规记录通用过滤：账号 / 任务 / 关键词（文件名或路径，不区分大小写）
-function filterViolationRecords(records, { accountId, taskId, keyword } = {}) {
+// 违规记录通用过滤：账号 / 任务 / 关键词 / 状态（文件名或路径，不区分大小写）
+function filterViolationRecords(records, { accountId, taskId, keyword, status } = {}) {
     let result = [...records];
     if (accountId) {
         result = result.filter(r => r.account_id == accountId);
@@ -16,6 +16,10 @@ function filterViolationRecords(records, { accountId, taskId, keyword } = {}) {
             (r.filename || '').toLowerCase().includes(kw) ||
             (r.path || '').toLowerCase().includes(kw)
         );
+    }
+    if (status) {
+        const allowed = Array.isArray(status) ? status : [status];
+        result = result.filter(r => allowed.includes(r.status));
     }
     result.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
     return result;
@@ -138,8 +142,8 @@ class AppDatabase {
         return newRecord.id;
     }
 
-    getViolationRecords({ accountId, taskId, keyword, page = 1, pageSize = 50 } = {}) {
-        let records = filterViolationRecords(this.data.violationRecords, { accountId, taskId, keyword });
+    getViolationRecords({ accountId, taskId, keyword, status, page = 1, pageSize = 50 } = {}) {
+        let records = filterViolationRecords(this.data.violationRecords, { accountId, taskId, keyword, status });
 
         const total = records.length;
         const offset = (page - 1) * pageSize;
@@ -148,8 +152,8 @@ class AppDatabase {
         return { records: paginated, total, page, pageSize };
     }
 
-    getAllViolationRecords({ accountId, taskId, keyword } = {}) {
-        return filterViolationRecords(this.data.violationRecords, { accountId, taskId, keyword });
+    getAllViolationRecords({ accountId, taskId, keyword, status } = {}) {
+        return filterViolationRecords(this.data.violationRecords, { accountId, taskId, keyword, status });
     }
 
     deleteViolationRecord(id) {
@@ -166,11 +170,12 @@ class AppDatabase {
         return record;
     }
 
-    clearViolationRecords({ accountId, taskId, onlySuccess = false } = {}) {
+    clearViolationRecords({ accountId, taskId, onlySuccess = false, onlyDeleted = false } = {}) {
         this.data.violationRecords = this.data.violationRecords.filter(r => {
             if (accountId && r.account_id != accountId) return true;
             if (taskId && r.task_id != taskId) return true;
             if (onlySuccess && r.status !== 'success' && r.status !== 'deleted' && r.status !== 'moved') return true;
+            if (onlyDeleted && r.status !== 'deleted') return true;
             return false;
         });
         this.save();

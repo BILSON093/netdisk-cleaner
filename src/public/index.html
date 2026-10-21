@@ -97,7 +97,8 @@
                     <div class="form-row">
                         <div class="form-group">
                             <label>检测间隔(ms)</label>
-                            <input type="number" id="check-delay" class="form-control" value="1000" min="0" step="100">
+                            <input type="number" id="check-delay" class="form-control" value="2000" min="0" step="100">
+                            <small class="form-hint">间隔越小检测越快，但过快会触发网盘频率限制</small>
                         </div>
                     </div>
                     
@@ -216,11 +217,17 @@
                         <button class="btn btn-danger" id="btn-delete-violation-files">
                             <span>🗑️</span> 删除违规文件
                         </button>
+                        <button class="btn btn-outline" id="btn-move-violation-files">
+                            <span>📂</span> 一键移动文件
+                        </button>
                         <button class="btn btn-outline" id="btn-export-violations">
                             <span>📤</span> 导出
                         </button>
+                        <button class="btn btn-outline" id="btn-clear-deleted-violations">
+                            <span>🧹</span> 清空已删除记录
+                        </button>
                         <button class="btn btn-danger" id="btn-clear-violations">
-                            <span>🗑️</span> 清空
+                            <span>🗑️</span> 全部清空记录
                         </button>
                     </div>
                 </div>

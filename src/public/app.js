@@ -484,6 +484,8 @@ function updateProgressUI(progress, results) {
 function getStatusText(status) {
     const map = {
         'violation': '违规',
+        'pending_delete': '待删除',
+        'pending_move': '待移动',
         'deleted': '已删除',
         'moved': '已移动',
         'delete_failed': '删除失败',
@@ -690,8 +692,13 @@ async function runDeleteWithProgress(url, body, btn, onDone) {
 
 let violationsPage = 1;
 const violationsPageSize = 25;
+// 跨页全选：非 null 时表示已选中全部页的记录 ids
+let violationsSelectedAllIds = null;
 
 async function loadViolations() {
+    // 每次刷新/筛选都重置跨页全选（避免用户翻页后忘了自己之前跨页全选了）
+    violationsSelectedAllIds = null;
+    document.getElementById('check-all-violations').checked = false;
     const accountId = document.getElementById('violation-account-filter').value;
     const keyword = document.getElementById('violation-search').value.trim();
     let url = `/api/violations?page=${violationsPage}&pageSize=${violationsPageSize}`;
@@ -779,11 +786,40 @@ document.getElementById('violation-search').addEventListener('input', () => {
     }, 300);
 });
 
-document.getElementById('check-all-violations').addEventListener('change', (e) => {
-    document.querySelectorAll('.violation-check').forEach(cb => {
-        cb.checked = e.target.checked;
-    });
+document.getElementById('check-all-violations').addEventListener('change', async (e) => {
+    const checkboxes = document.querySelectorAll('.violation-check');
+    // 先勾/取消当前页
+    checkboxes.forEach(cb => { cb.checked = e.target.checked; });
+
+    if (e.target.checked && confirm('是否跨所有页全选？\n\n"确定"=选中全部页的所有记录\n"取消"=仅选中当前页记录')) {
+        // 跨页全选：加载全部记录的 ids
+        violationsSelectedAllIds = await getAllViolationIds();
+        showToast(`已跨页全选 ${violationsSelectedAllIds.length} 条记录`, 'success');
+    } else if (!e.target.checked) {
+        // 取消时清空跨页标记
+        violationsSelectedAllIds = null;
+    }
 });
+
+// 获取当前筛选条件下全部违规记录的 ids（用于跨页全选）
+async function getAllViolationIds() {
+    const accountId = document.getElementById('violation-account-filter').value;
+    const keyword = document.getElementById('violation-search').value.trim();
+    let url = '/api/violations?page=1&pageSize=99999';
+    if (accountId) url += `&accountId=${accountId}`;
+    if (keyword) url += `&keyword=${encodeURIComponent(keyword)}`;
+    try {
+        const res = await API.get(url);
+        if (res.success) return res.data.records.map(r => r.id);
+    } catch (e) {}
+    return [];
+}
+
+// 获取当前操作的目标 ids（跨页全选优先，否则取当前页勾选项）
+function getViolationTargetIds() {
+    if (violationsSelectedAllIds) return violationsSelectedAllIds;
+    return [...document.querySelectorAll('.violation-check:checked')].map(cb => cb.dataset.id);
+}
 
 document.getElementById('btn-export-violations').addEventListener('click', () => {
     const accountId = document.getElementById('violation-account-filter').value;
@@ -802,11 +838,58 @@ document.getElementById('btn-delete-violation-files').addEventListener('click', 
         return;
     }
 
-    const selected = [...document.querySelectorAll('.violation-check:checked')].map(cb => cb.dataset.id);
-    const scope = selected.length > 0 ? `选中的 ${selected.length} 个` : '该账号下全部未删除的';
+    const selected = getViolationTargetIds();
+    let scope;
+    if (violationsSelectedAllIds) {
+        scope = `跨页全部 ${selected.length} 个（已排除已删除的）`;
+    } else {
+        scope = selected.length > 0 ? `选中的 ${selected.length} 个` : '该账号下全部未删除的';
+    }
     if (!confirm(`确定要从百度网盘中删除${scope}违规文件吗？\n\n文件将移入网盘回收站，回收站清空后不可恢复！`)) return;
 
     await runDeleteWithProgress('/api/violations/delete-files', { accountId, ids: selected }, e.currentTarget, loadViolations);
+});
+
+// 一键移动违规文件到指定文件夹
+document.getElementById('btn-move-violation-files').addEventListener('click', async (e) => {
+    const accountId = document.getElementById('violation-account-filter').value;
+    if (!accountId) {
+        showToast('请先在左上角筛选出要操作的账号', 'error');
+        return;
+    }
+
+    const selected = getViolationTargetIds();
+    let scope;
+    if (violationsSelectedAllIds) {
+        scope = `跨页全部 ${selected.length} 个`;
+    } else {
+        scope = selected.length > 0 ? `选中的 ${selected.length} 个` : '该账号下全部未移动/删除的';
+    }
+
+    const targetPath = prompt(`请输入移动目标文件夹路径：\n\n（例如 /违规文件 或 /和谐文件/待处理）`);
+    if (!targetPath) return;
+
+    if (!confirm(`确定要将${scope}违规文件移动到 "${targetPath}" 吗？`)) return;
+
+    await runDeleteWithProgress('/api/violations/move-files', { accountId, ids: selected, targetPath }, e.currentTarget, loadViolations);
+});
+
+// 清空已删除记录（只清 status=deleted 的记录）
+document.getElementById('btn-clear-deleted-violations').addEventListener('click', async () => {
+    if (!confirm('确定要清空所有已删除的违规记录吗？\n\n（仅清除状态为"已删除"的记录，其他状态保留）')) return;
+
+    const accountId = document.getElementById('violation-account-filter').value;
+    try {
+        const res = await API.post('/api/violations/clear', { accountId, onlyDeleted: true });
+        if (res.success) {
+            showToast('已清理', 'success');
+            loadViolations();
+        } else {
+            showToast(res.message || '操作失败', 'error');
+        }
+    } catch (e) {
+        showToast('操作失败: ' + e.message, 'error');
+    }
 });
 
 document.getElementById('btn-clear-violations').addEventListener('click', async () => {

@@ -368,17 +368,53 @@ document.getElementById('btn-probe-check').addEventListener('click', async () =>
     }
 });
 
-document.getElementById('btn-start-check').addEventListener('click', startCheck);
+document.getElementById('btn-start-check').addEventListener('click', () => startCheck(false));
+document.getElementById('btn-resume-check').addEventListener('click', () => startCheck(true));
 document.getElementById('btn-pause-check').addEventListener('click', togglePause);
 document.getElementById('btn-stop-check').addEventListener('click', stopCheck);
 
-async function startCheck() {
+// 当前可续跑的任务（由 /api/check/resumable 返回）
+let resumableTask = null;
+
+// 查询当前账号 + 目录下是否有可续跑的任务，有则显示"继续上次检测"按钮
+async function checkResumable() {
+    const accountId = document.getElementById('check-account').value;
+    const dir = document.getElementById('check-dir').value.trim() || '/';
+    const btn = document.getElementById('btn-resume-check');
+    const hint = document.getElementById('resume-hint');
+    resumableTask = null;
+    btn.style.display = 'none';
+    hint.style.display = 'none';
+    if (!accountId) return;
+    try {
+        const res = await API.get(`/api/check/resumable?accountId=${encodeURIComponent(accountId)}&dir=${encodeURIComponent(dir)}`);
+        if (res.success && res.data) {
+            resumableTask = res.data;
+            const pct = resumableTask.totalFiles > 0
+                ? Math.round((resumableTask.checkedFiles / resumableTask.totalFiles) * 100)
+                : 0;
+            btn.style.display = 'inline-flex';
+            btn.title = `续跑任务 #${resumableTask.taskId}（已检测 ${resumableTask.checkedFiles}/${resumableTask.totalFiles}）`;
+            hint.style.display = 'block';
+            hint.innerHTML = `📌 检测到未完成任务：已检测 <b>${resumableTask.checkedFiles}</b> / ${resumableTask.totalFiles}（${pct}%），已发现违规 <b>${resumableTask.violationCount}</b> 个。点击 <b>继续上次检测</b> 从断点继续。`;
+        }
+    } catch (e) {
+        console.warn('查询可续跑任务失败:', e);
+    }
+}
+
+// 账号 / 目录变化时重新查询
+document.getElementById('check-account').addEventListener('change', checkResumable);
+document.getElementById('check-dir').addEventListener('blur', checkResumable);
+document.getElementById('check-dir').addEventListener('change', checkResumable);
+
+async function startCheck(useResume) {
     const accountId = document.getElementById('check-account').value;
     if (!accountId) {
         showToast('请先选择账号', 'error');
         return;
     }
-    
+
     const dir = document.getElementById('check-dir').value.trim() || '/';
     const delay = document.getElementById('check-delay').value;
     const includeKeywords = document.getElementById('check-include').value;
@@ -388,30 +424,40 @@ async function startCheck() {
     const autoDelete = action === 'delete';
     const movePath = action === 'move' ? document.getElementById('check-move-path').value.trim() : '';
 
-    const btn = document.getElementById('btn-start-check');
+    const btn = useResume ? document.getElementById('btn-resume-check') : document.getElementById('btn-start-check');
     btn.disabled = true;
 
+    const payload = {
+        accountId,
+        dir,
+        delay,
+        includeKeywords,
+        excludeKeywords,
+        autoDelete,
+        movePath
+    };
+    if (useResume && resumableTask) {
+        payload.resumeTaskId = resumableTask.taskId;
+    }
+
     try {
-        const res = await API.post('/api/check/start', {
-            accountId,
-            dir,
-            delay,
-            includeKeywords,
-            excludeKeywords,
-            autoDelete,
-            movePath
-        });
-        
+        const res = await API.post('/api/check/start', payload);
+
         if (res.success) {
             currentTaskId = res.data.taskId;
-            showToast('检测任务已启动', 'success');
-            
+            const msg = res.data.resumed
+                ? `已续跑任务（从 ${res.data.baseChecked} 个文件处继续）`
+                : '检测任务已启动';
+            showToast(msg, 'success');
+
             // 显示进度区域
             document.getElementById('progress-card').style.display = 'block';
             document.getElementById('btn-pause-check').style.display = 'inline-flex';
             document.getElementById('btn-stop-check').style.display = 'inline-flex';
-            btn.style.display = 'none';
-            
+            document.getElementById('btn-start-check').style.display = 'none';
+            document.getElementById('btn-resume-check').style.display = 'none';
+            document.getElementById('resume-hint').style.display = 'none';
+
             // 开始轮询进度
             startProgressPolling();
         } else {
@@ -438,14 +484,15 @@ function startProgressPolling() {
                 if (!res.data.progress.isRunning) {
                     clearInterval(progressTimer);
                     showToast('检测完成', 'success');
-                    
+
                     document.getElementById('btn-start-check').style.display = 'inline-flex';
                     document.getElementById('btn-pause-check').style.display = 'none';
                     document.getElementById('btn-stop-check').style.display = 'none';
                     document.getElementById('btn-start-check').disabled = false;
-                    
-                    // 刷新违规记录
+
+                    // 刷新违规记录 & 重新查询是否还有可续跑任务
                     loadViolations();
+                    checkResumable();
                 }
             }
         } catch (e) {
@@ -518,11 +565,13 @@ async function togglePause() {
 
 async function stopCheck() {
     if (!currentTaskId) return;
-    if (!confirm('确定要停止检测吗？')) return;
-    
+    if (!confirm('确定要停止检测吗？已检测的进度会保存，下次可继续。')) return;
+
     try {
         await API.post(`/api/check/stop/${currentTaskId}`, {});
-        showToast('已停止', 'warning');
+        showToast('已停止，进度已保存', 'warning');
+        // 停止后重新查询是否可续跑
+        setTimeout(checkResumable, 500);
     } catch (e) {
         showToast('操作失败: ' + e.message, 'error');
     }

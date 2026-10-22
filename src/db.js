@@ -123,6 +123,13 @@ class AppDatabase {
     // ========== 和谐文件记录 ==========
 
     addViolationRecord(record) {
+        // 去重：同一任务同一 fs_id 只保留一条（防止 resume 时水位线滞后导致重复插入）
+        if (record.taskId && record.fs_id) {
+            const exists = this.data.violationRecords.find(r =>
+                r.task_id == record.taskId && String(r.fs_id) === String(record.fs_id)
+            );
+            if (exists) return exists.id;
+        }
         const now = new Date().toISOString();
         const newRecord = {
             id: this.data.nextRecordId++,
@@ -196,6 +203,10 @@ class AppDatabase {
             status: task.status || 'running',
             include_keywords: task.includeKeywords || '',
             exclude_keywords: task.excludeKeywords || '',
+            // 断点续检水位线：最后一次成功检测文件的位置（按"目录路径 + 文件名"字典序定位）
+            // 不存 fs_id 数组——13k 个 fs_id 会让 data.json 爆炸
+            watermark_dir: task.watermarkDir || null,
+            watermark_name: task.watermarkName || null,
             created_at: now,
             finished_at: null
         };
@@ -208,7 +219,7 @@ class AppDatabase {
         const task = this.data.checkTasks.find(t => t.task_id == taskId);
         if (task) {
             Object.assign(task, data);
-            if (data.status === 'completed' || data.status === 'stopped') {
+            if (data.status === 'completed' || data.status === 'stopped' || data.status === 'interrupted' || data.status === 'error') {
                 task.finished_at = new Date().toISOString();
             }
             this.save();
@@ -223,6 +234,39 @@ class AppDatabase {
         }
         tasks.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
         return tasks.slice(0, 50);
+    }
+
+    getTask(taskId) {
+        return this.data.checkTasks.find(t => t.task_id == taskId) || null;
+    }
+
+    // 找该账号该目录最新一个可续跑的任务（interrupted 或 stopped 且还有水位线）
+    // 用于"继续上次检测"按钮
+    getResumableTask(accountId, dir) {
+        const candidates = this.data.checkTasks
+            .filter(t =>
+                t.account_id == accountId &&
+                t.dir === (dir || '/') &&
+                (t.status === 'interrupted' || t.status === 'stopped') &&
+                t.watermark_dir != null &&
+                (t.checked_files || 0) < (t.total_files || 0)
+            )
+            .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+        return candidates[0] || null;
+    }
+
+    // 服务启动时调用：把内存里已不存在的 running 任务标记为 interrupted（保留水位线供续跑）
+    markInterruptedTasks() {
+        let count = 0;
+        for (const t of this.data.checkTasks) {
+            if (t.status === 'running') {
+                t.status = 'interrupted';
+                t.finished_at = new Date().toISOString();
+                count++;
+            }
+        }
+        if (count > 0) this.save();
+        return count;
     }
 
     // ========== 重复文件扫描结果 ==========

@@ -28,6 +28,12 @@ if (!fs.existsSync(dataDir)) {
 // 初始化数据库
 const db = new Database(dataDir);
 
+// 服务启动时把内存里残留的 running 任务标记为 interrupted（保留水位线供断点续检）
+const interruptedCount = db.markInterruptedTasks();
+if (interruptedCount > 0) {
+    console.log(`已将 ${interruptedCount} 个意外中断的检测任务标记为 interrupted（可断点续检）`);
+}
+
 // 存储活跃的API实例
 const apiInstances = new Map();
 
@@ -426,71 +432,159 @@ app.post('/api/check/probe', async (req, res) => {
     }
 });
 
-// 开始检测任务
+// 开始检测任务（支持断点续检：传 resumeTaskId 沿用旧任务）
 app.post('/api/check/start', async (req, res) => {
     try {
-        const { accountId, dir = '/', includeKeywords = '', excludeKeywords = '', delay = 1000, autoDelete = false, movePath = '' } = req.body;
+        const { accountId, dir = '/', includeKeywords = '', excludeKeywords = '', delay = 2000, autoDelete = false, movePath = '', resumeTaskId = null } = req.body;
         const account = db.getAccount(accountId);
         if (!account) {
             return res.json({ success: false, message: '账号不存在' });
         }
 
-        const taskId = Date.now().toString();
+        // ===== 断点续检：沿用旧 taskId，从水位线继续 =====
+        let taskId;
+        let resumeWatermark = null;
+        let baseChecked = 0;
+        let baseViolation = 0;
+        let oldTask = null;
 
-        // 创建任务记录
-        db.addTask({
-            taskId,
-            accountId,
-            dir,
-            includeKeywords,
-            excludeKeywords,
-            status: 'running'
-        });
+        if (resumeTaskId) {
+            oldTask = db.getTask(resumeTaskId);
+            if (!oldTask) {
+                return res.json({ success: false, message: '要续跑的任务不存在' });
+            }
+            if (oldTask.account_id != accountId) {
+                return res.json({ success: false, message: '任务与账号不匹配' });
+            }
+            if (oldTask.status === 'running') {
+                return res.json({ success: false, message: '任务仍在运行中，无法续跑' });
+            }
+            taskId = String(resumeTaskId);
+            if (oldTask.watermark_dir != null) {
+                resumeWatermark = { dir: oldTask.watermark_dir, name: oldTask.watermark_name || '' };
+            }
+            baseChecked = oldTask.checked_files || 0;
+            baseViolation = oldTask.violation_count || 0;
+            // 把旧任务标记回 running，并清空 finished_at
+            db.updateTask(taskId, { status: 'running' });
+        } else {
+            taskId = Date.now().toString();
+            db.addTask({
+                taskId,
+                accountId,
+                dir,
+                includeKeywords,
+                excludeKeywords,
+                status: 'running'
+            });
+        }
+
+        // ===== 实时落库：违规记录节流写盘 =====
+        // 违规较少（一般几十~几百条），直接每条都写，但每 5 条或 3 秒才真正 flush 到磁盘
+        let violationSinceFlush = 0;
+        let lastViolationFlushAt = 0;
+        let pendingViolationCount = baseViolation;
+        const flushViolation = (force = false) => {
+            if (violationSinceFlush === 0) return;
+            const now = Date.now();
+            if (!force && violationSinceFlush < 5 && now - lastViolationFlushAt < 3000) return;
+            db.updateTask(taskId, { violation_count: pendingViolationCount });
+            violationSinceFlush = 0;
+            lastViolationFlushAt = now;
+        };
+
+        // ===== 进度上报：水位线 + checked_files 节流写盘 =====
+        // 每 20 个文件或 5 秒写一次，避免写放大
+        let progressSinceFlush = 0;
+        let lastProgressFlushAt = 0;
+        let pendingCheckedFiles = baseChecked;
+        let pendingWatermark = resumeWatermark;
+        const flushProgress = (force = false) => {
+            if (progressSinceFlush === 0) return;
+            const now = Date.now();
+            if (!force && progressSinceFlush < 20 && now - lastProgressFlushAt < 5000) return;
+            db.updateTask(taskId, {
+                checked_files: pendingCheckedFiles,
+                watermark_dir: pendingWatermark ? pendingWatermark.dir : null,
+                watermark_name: pendingWatermark ? pendingWatermark.name : null
+            });
+            progressSinceFlush = 0;
+            lastProgressFlushAt = now;
+        };
 
         const checker = new ViolationChecker(account, {
             dir,
             includeKeywords: includeKeywords ? includeKeywords.split(/[,，]/).filter(Boolean) : [],
             excludeKeywords: excludeKeywords ? excludeKeywords.split(/[,，]/).filter(Boolean) : [],
-            delay: parseInt(delay) || 1000,
+            delay: parseInt(delay) || 2000,
             autoDelete: !!autoDelete,
-            movePath: movePath || ''
+            movePath: movePath || '',
+            resumeWatermark,
+            onViolation: (record) => {
+                // 立即写违规记录（含去重）
+                db.addViolationRecord({
+                    accountId,
+                    taskId,
+                    filename: record.filename,
+                    path: record.path,
+                    fs_id: record.fs_id,
+                    size: record.size,
+                    reason: record.reason,
+                    status: record.status,
+                    is_dir: record.is_dir
+                });
+                pendingViolationCount++;
+                violationSinceFlush++;
+                flushViolation(false);
+            },
+            onProgress: ({ lastFile }) => {
+                if (!lastFile) return;
+                pendingCheckedFiles = baseChecked + checker.checkedFiles + checker._skippedByWatermark;
+                pendingWatermark = { dir: lastFile.dir, name: lastFile.name };
+                progressSinceFlush++;
+                flushProgress(false);
+            }
         });
 
         checkTasks.set(taskId, checker);
 
         // 开始检测
         checker.start().then(() => {
-            // 检测完成，保存记录
-            const results = checker.getResults();
             const progress = checker.getProgress();
-            
-            results.forEach(item => {
-                db.addViolationRecord({
-                    accountId,
-                    taskId,
-                    filename: item.filename,
-                    path: item.path,
-                    fs_id: item.fs_id,
-                    size: item.size,
-                    reason: item.reason,
-                    status: item.status,
-                    is_dir: item.is_dir
-                });
-            });
+            // 最终一次性强写所有 pending 状态
+            pendingViolationCount = baseViolation + progress.violation;
+            pendingCheckedFiles = baseChecked + progress.checked;
+            violationSinceFlush = Math.max(violationSinceFlush, 1);
+            progressSinceFlush = Math.max(progressSinceFlush, 1);
+            flushViolation(true);
+            flushProgress(true);
 
-            // 更新任务状态
+            // 更新任务状态为完成
             db.updateTask(taskId, {
                 status: 'completed',
                 total_files: progress.total,
-                checked_files: progress.checked,
-                violation_count: progress.violation
+                checked_files: pendingCheckedFiles,
+                violation_count: pendingViolationCount
             });
+            checkTasks.delete(taskId);
         }).catch(err => {
             console.error('检测任务出错:', err);
+            flushViolation(true);
+            flushProgress(true);
             db.updateTask(taskId, { status: 'error' });
+            checkTasks.delete(taskId);
         });
 
-        res.json({ success: true, data: { taskId } });
+        res.json({
+            success: true,
+            data: {
+                taskId,
+                resumed: !!resumeTaskId,
+                baseChecked,
+                baseViolation,
+                watermark: resumeWatermark
+            }
+        });
     } catch (e) {
         res.json({ success: false, message: e.message });
     }
@@ -539,7 +633,7 @@ app.post('/api/check/resume/:taskId', (req, res) => {
     }
 });
 
-// 停止检测任务
+// 停止检测任务（违规记录已实时入库，无需重复写）
 app.post('/api/check/stop/:taskId', (req, res) => {
     try {
         const taskId = req.params.taskId;
@@ -547,35 +641,57 @@ app.post('/api/check/stop/:taskId', (req, res) => {
         if (!checker) {
             return res.json({ success: false, message: '任务不存在' });
         }
+        // 防呆：确认任务确实属于内存中这个 checker（避免 taskId 串号）
+        if (!checker.account || !checker.account.id) {
+            return res.json({ success: false, message: '任务状态异常' });
+        }
         checker.stop();
-        
-        // 保存已有结果
-        const results = checker.getResults();
+
+        // 任务最终落库由 start().then/catch 完成（status=stopped 时由调用方补充）
+        // 这里立即把状态写为 stopped，让前端能立刻看到
         const progress = checker.getProgress();
-        const accountId = checker.account.id;
-        
-        results.forEach(item => {
-            db.addViolationRecord({
-                accountId,
-                taskId,
-                filename: item.filename,
-                path: item.path,
-                fs_id: item.fs_id,
-                size: item.size,
-                reason: item.reason,
-                status: item.status,
-                is_dir: item.is_dir
-            });
-        });
-        
+        const dbTask = db.getTask(taskId);
+        const baseChecked = dbTask && dbTask._baseChecked ? dbTask._baseChecked : 0;
         db.updateTask(taskId, {
             status: 'stopped',
             total_files: progress.total,
             checked_files: progress.checked,
-            violation_count: progress.violation
+            violation_count: (dbTask ? dbTask.violation_count : 0)
         });
-        
+
         res.json({ success: true });
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
+});
+
+// 查询账号在某目录下是否有可续跑的检测任务
+app.get('/api/check/resumable', (req, res) => {
+    try {
+        const { accountId, dir = '/' } = req.query;
+        if (!accountId) {
+            return res.json({ success: false, message: '缺少 accountId' });
+        }
+        const task = db.getResumableTask(accountId, dir);
+        if (!task) {
+            return res.json({ success: true, data: null });
+        }
+        res.json({
+            success: true,
+            data: {
+                taskId: task.task_id,
+                dir: task.dir,
+                status: task.status,
+                totalFiles: task.total_files,
+                checkedFiles: task.checked_files,
+                violationCount: task.violation_count,
+                watermark: task.watermark_dir ? { dir: task.watermark_dir, name: task.watermark_name } : null,
+                includeKeywords: task.include_keywords,
+                excludeKeywords: task.exclude_keywords,
+                createdAt: task.created_at,
+                finishedAt: task.finished_at
+            }
+        });
     } catch (e) {
         res.json({ success: false, message: e.message });
     }

@@ -33,6 +33,18 @@ class ViolationChecker {
         this._rateLimitedDetected = false;
         // 待移动/删除的违规文件队列（检测完统一批量执行，避免与检测请求交叉叠加触发风控）
         this._pendingActions = [];
+
+        // 回调：实时持久化（由 main.js 注入）
+        // onViolation(record) 每检出一个违规立即调用（实时写库）
+        // onProgress({counts, lastFile}) 每检测一个文件调用（调用方自行节流）
+        this.onViolation = typeof options.onViolation === 'function' ? options.onViolation : null;
+        this.onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+
+        // 断点续检水位线：{dir, name}，按"目录路径 + 文件名"字典序定位
+        // 严格小于水位线的文件视为已检测，直接跳过
+        this.resumeWatermark = options.resumeWatermark || null;
+        this._skippedByWatermark = 0;
+        this._passedWatermark = !this.resumeWatermark;   // 无水位线时从一开始就保留
     }
 
     // 关键词过滤
@@ -58,11 +70,14 @@ class ViolationChecker {
         return true;
     }
 
-    // 收集所有文件
+    // 收集所有文件（确定性顺序：目录内按 server_filename 字典序，子目录与文件混排递归）
+    // 这样水位线 (dir, name) 可以稳定定位"上次检测到哪里"
+    // 水位线过滤在递归最深层做（全局 _passedWatermark 标志，遇到严格大于水位线的文件即翻转）
     async collectFiles(dir = '/') {
         try {
             let page = 1;
             const num = 100;
+            const localItems = [];   // 本目录所有项目（文件 + 子目录占位符，混排）
 
             while (true) {
                 if (this.isStopped) break;
@@ -70,26 +85,48 @@ class ViolationChecker {
                 const result = await this.api.getFileList(dir, page, num);
                 if (!result.list || result.list.length === 0) break;
 
-                for (const item of result.list) {
-                    if (this.isStopped) break;
+                // 全部项目按 server_filename 字典序排序（文件与子目录混排，保证全局遍历顺序确定）
+                const sorted = [...result.list].sort((a, b) =>
+                    String(a.server_filename).localeCompare(String(b.server_filename), 'zh-CN')
+                );
 
+                for (const item of sorted) {
                     if (item.isdir === 1) {
-                        // 递归子目录
-                        await this.collectFiles(item.path);
-                    } else {
-                        // 检查关键词过滤
-                        if (this.filterByKeywords(item.server_filename)) {
-                            this.allFiles.push(item);
-                            this.totalFiles = this.allFiles.length;
-                        }
+                        localItems.push({ __isSubdir: true, path: item.path });
+                    } else if (this.filterByKeywords(item.server_filename)) {
+                        localItems.push(item);
                     }
                 }
 
                 if (!result.has_more) break;
                 page++;
-
-                // 延迟避免过快
                 await this.sleep(200);
+            }
+
+            // 按混排顺序处理：子目录递归、文件入 allFiles
+            for (const item of localItems) {
+                if (this.isStopped) break;
+
+                if (item.__isSubdir) {
+                    await this.collectFiles(item.path);
+                    continue;
+                }
+
+                // 水位线过滤：跳过严格不大于 (wm.dir, wm.name) 的文件
+                if (!this._passedWatermark) {
+                    const wm = this.resumeWatermark;
+                    const cmpDir = String(dir).localeCompare(String(wm.dir), 'zh-CN');
+                    const cmpName = String(item.server_filename).localeCompare(String(wm.name), 'zh-CN');
+                    if (cmpDir > 0 || (cmpDir === 0 && cmpName > 0)) {
+                        this._passedWatermark = true;
+                    } else {
+                        this._skippedByWatermark++;
+                        continue;
+                    }
+                }
+
+                this.allFiles.push(item);
+                this.totalFiles = this.allFiles.length + this._skippedByWatermark;
             }
         } catch (e) {
             console.error(`收集目录文件失败 ${dir}:`, e.message);
@@ -224,22 +261,48 @@ class ViolationChecker {
         return null; // 无法确认 → 归为失败，避免误报
     }
 
+    // 统一上报进度（每检测一个文件调用一次，由调用方节流）
+    _emitProgress(file) {
+        const dir = (file.path || '').slice(0, (file.path || '').lastIndexOf('/')) || '/';
+        this._lastProcessedFile = { dir, name: file.server_filename };
+        if (!this.onProgress) return;
+        try {
+            this.onProgress({
+                counts: {
+                    total: this.totalFiles,
+                    checked: this.checkedFiles,
+                    violation: this.violationFiles.length,
+                    normal: this.normalFiles.length,
+                    failed: this.failedFiles.length
+                },
+                lastFile: this._lastProcessedFile
+            });
+        } catch (e) { /* 回调异常不影响检测 */ }
+    }
+
     async recordNormal(file) {
         this.normalFiles.push({
             fs_id: file.fs_id, filename: file.server_filename, path: file.path,
             size: file.size, is_dir: file.isdir, reason: '正常', code: 0, status: 'normal'
         });
         this.checkedFiles++;
+        this._emitProgress(file);
     }
 
     async recordViolation(file) {
         const status = await this.handleViolationFile(file);
-        this.violationFiles.push({
+        const record = {
             fs_id: file.fs_id, filename: file.server_filename, path: file.path,
             size: file.size, is_dir: file.isdir,
             reason: '文件违规（无法获取下载直链）', code: -1, status
-        });
+        };
+        this.violationFiles.push(record);
         this.checkedFiles++;
+        // 实时落库（由 main.js 注入，立即写 violationRecords + 累加 task 计数）
+        if (this.onViolation) {
+            try { this.onViolation(record); } catch (e) { /* 回调异常不影响检测 */ }
+        }
+        this._emitProgress(file);
     }
 
     async recordFailed(file, reason) {
@@ -248,6 +311,7 @@ class ViolationChecker {
             size: file.size, is_dir: file.isdir, reason: reason || '检测失败', code: -1, status: 'failed'
         });
         this.checkedFiles++;
+        this._emitProgress(file);
     }
 
     // ====== download 引擎：二分定位 + 复核（可识别软和谐） ======
@@ -429,16 +493,20 @@ class ViolationChecker {
     }
 
     getProgress() {
+        // 断点续检时 total 需要包含被水位线跳过的数量（否则前端显示进度会倒退）
+        const total = this.allFiles.length + this._skippedByWatermark || this.totalFiles;
         return {
-            total: this.totalFiles,
-            checked: this.checkedFiles,
+            total,
+            checked: this.checkedFiles + this._skippedByWatermark,
             violation: this.violationFiles.length,
             normal: this.normalFiles.length,
             failed: this.failedFiles.length,
+            skipped: this._skippedByWatermark,
             isRunning: this.isRunning,
             isPaused: this.isPaused,
             isStopped: this.isStopped,
-            percent: this.totalFiles > 0 ? Math.round((this.checkedFiles / this.totalFiles) * 100) : 0
+            lastFile: this._lastProcessedFile || null,
+            percent: total > 0 ? Math.round(((this.checkedFiles + this._skippedByWatermark) / total) * 100) : 0
         };
     }
 
